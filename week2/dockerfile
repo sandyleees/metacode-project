@@ -1,0 +1,8 @@
+FROM apache/spark:3.5.1
+
+# ivy 캐시 디렉토리 미리 생성 + 권한 부여
+USER root
+RUN mkdir -p /home/spark/.ivy2/cache && \
+    chown -R spark:spark /home/spark/.ivy2
+
+USER spark

@@ -1,0 +1,16 @@
+services:
+  spark:
+    build: .
+    container_name: iceberg-spark
+    environment:
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_REGION=ap-northeast-2
+    volumes:
+      - ./:/home/spark/work
+    working_dir: /home/spark/work
+    entrypoint: /opt/spark/bin/spark-submit
+    command:
+      - "--packages"
+      - "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.4.3,software.amazon.awssdk:bundle:2.20.18,software.amazon.awssdk:url-connection-client:2.20.18"
+      - "metacode-iceberg-example.py"
