@@ -1,5 +1,8 @@
+# 전체적으로 해당 옵션이 왜 필요한지 이해하는 과정이 필요해보임. 우선은 구현과 돌아가는지에 집중했음. 
+
 services:
 
+  # ── Zookeeper ──────────────────────────────────────────────────────────────
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0
     container_name: zookeeper
@@ -15,6 +18,7 @@ services:
     networks:
       - lakehouse
 
+  # ── Kafka broker ──────────────────────────────────────────────────────────
   kafka:
     image: confluentinc/cp-kafka:7.6.0
     container_name: kafka
@@ -22,10 +26,12 @@ services:
       zookeeper:
         condition: service_healthy
     ports:
-      - "9092:9092"
+      - "9092:9092"  # 호스트: localhost:9092 / 컨테이너 간: kafka:29092
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # 내부(컨테이너 간): PLAINTEXT://kafka:29092
+      # 외부(호스트):      PLAINTEXT_HOST://localhost:9092
       KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
@@ -41,6 +47,10 @@ services:
     networks:
       - lakehouse
 
+  # ── Producer ──────────────────────────────────────────────────────────────
+  # producer.py가 main() 첫 번째 동작으로 create_topics()를 호출해 토픽을 생성
+  # → kafka-to-raw는 producer: service_started에 의존해 토픽이 생성된 후 시작되도록 순서 보장
+  # race condition 대비: kafka-to-raw에 restart: on-failure 추가 (아래 참고)
   producer:
     build:
       context: .
@@ -56,6 +66,8 @@ services:
     networks:
       - lakehouse
 
+
+  # ── Kafka UI ──────────────────────────────────────────────────────────────
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
     container_name: kafka-ui
@@ -69,9 +81,129 @@ services:
     networks:
       - lakehouse
 
+      # Spark 환경 구성에서 dockerfile 내용(왜 이렇게 작성해야 하는지)이나 
+      # 구체적인 yaml 내용 흐름 이해하진 못했음.(해당 설정 왜 필요?) 우선 돌아가는지에 집중.
+    # ── Spark Master ──────────────────────────────────────────────────────────
+  spark-master:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: spark-master
+    # hostname을 서비스명과 동일하게 고정 - 미설정 시 Docker가 랜덤 해시를 할당해
+    # Master가 자신의 주소를 랜덤 해시로 광고 → Worker/Driver가 해당 주소로 역접속 실패
+    hostname: spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master --host spark-master
+    environment:
+      SPARK_NO_DAEMONIZE: "true"   # 포그라운드 실행 강제 - 없으면 컨테이너가 즉시 종료됨
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    ports:
+      - "8080:8080"   # Spark Master Web UI: http://localhost:8080
+      - "7077:7077"   # Worker / spark-submit 연결 포트
+    networks:
+      - lakehouse
+
+  # ── Spark Worker × 3 ──────────────────────────────────────────────────────
+  # Kafka 토픽 파티션 3개와 1:1 대응 → 각 파티션을 독립 executor로 병렬 처리
+  spark-worker-1:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark  # Driver와 동일한 JAR 환경 — ClassNotFoundException 방지
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_WORKER_MEMORY: 1g
+      SPARK_WORKER_CORES: 1
+    depends_on:
+      - spark-master
+    networks:
+      - lakehouse
+
+  spark-worker-2:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_WORKER_MEMORY: 1g
+      SPARK_WORKER_CORES: 1
+    depends_on:
+      - spark-master
+    networks:
+      - lakehouse
+
+  spark-worker-3:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      SPARK_NO_DAEMONIZE: "true"
+      SPARK_WORKER_MEMORY: 1g
+      SPARK_WORKER_CORES: 1
+    depends_on:
+      - spark-master
+    networks:
+      - lakehouse
+
+  # ── kafka_to_raw 스트리밍 job (Spark Driver) ──────────────────────────────────────────────
+  kafka-to-raw:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark  # 빌드 시점에 JAR을 ivy 캐시에 포함한 커스텀 이미지
+    container_name: kafka-to-raw
+    # kafka_to_raw.py의 SparkSession 내 .config("spark.jars.packages", ...) 은
+    # spark-submit 실행 후 SparkContext가 이미 초기화된 시점에 호출되므로 무시됨
+    # JAR 패키지는 SparkContext 생성 전인 --packages 플래그로만 반영 가능
+    command: >
+      /opt/spark/bin/spark-submit
+        --master spark://spark-master:7077
+        /app/kafka_to_raw.py
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      TOPIC_IMPRESSION: ad-impressions
+      TOPIC_CLICK: ad-clicks
+      TOPIC_CONVERSION: ad-conversions
+      S3_RAW_BASE: s3a://metacode-criteo-project/raw
+      CHECKPOINT_BASE: s3a://metacode-criteo-project/checkpoints/kafka_to_raw
+      # AWS 자격증명 - .env 파일 또는 호스트 환경변수에서 주입 (코드에 하드코딩 금지)
+      # 사용법: AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... docker compose up
+      # 이거 만약 실무 환경이라면 EC2에 올라가서 IAM Role로 해결가능?
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-ap-northeast-2}
+      # PySpark가 실행할 Python 인터프리터 명시 - 미설정 시 'python' 명령어를 찾아 실패할 수 있음
+      PYSPARK_PYTHON: python3
+      PYSPARK_DRIVER_PYTHON: python3
+    volumes:
+      - ./:/app                 # kafka_to_raw.py 마운트
+      # kafka_to_raw.py는 /app/kafka_to_raw.py로 실행되는데, ./에 Dockerfile.spark나 다른 파일들도 같이 마운트됨 
+      # — 이 자체가 문제는 아니지만, 개발 중 수정한 파일이 즉시 반영되어 예상치 못한 동작을 일으킬 수 있음.
+      # 운영 단계에서는 COPY로 이미지에 포함시키는 게 맞음. 지금은 개발 편의상 마운트는 OK.
+      # ivy_cache 볼륨 불필요 — JAR이 이미지 빌드 시 /root/.ivy2에 포함됨
+    ports:
+      - "4040:4040"   # Spark Application Web UI (Driver): http://localhost:4040
+    depends_on:
+      kafka:
+        condition: service_healthy    # readStream은 Kafka가 완전히 떠 있어야 연결 가능 : Kafka 미준비 → readStream 연결 실패
+      producer:
+        condition: service_started    # producer가 create_topics() 호출 후 토픽 생성 : 토픽 미존재 → 구독 실패
+      spark-master:
+        condition: service_healthy    # 7077 포트가 실제로 열린 후 spark-submit 제출 : Master 미준비 → spark://spark-master:7077 연결 실패
+    # producer의 create_topics()와 kafka-to-raw 시작 간 미세 race condition 대비
+    # 토픽 미존재로 실패 시 재시작 → 토픽 생성 완료 후 재시도에서 성공
+    restart: on-failure
+    networks:
+      - lakehouse
+
 networks:
   lakehouse:
     driver: bridge
 
 volumes:
-  hf_cache:   # 네임드 볼륨 선언
+  hf_cache:

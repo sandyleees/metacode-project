@@ -1,4 +1,13 @@
-# 컨테이너로 producer 띄울 예정
+# 컨테이너로 producer 띄울 예정 -- 계속 들어오는 streaming이면 항상 띄워놔야하나?
+# 멱등성 문제(재시작 시 처음부터 재발행 - 중복 등 문제) 
+# 예외처리 필요 - 아직은 구현에 집중
+# logging?
+
+'''
+실버 레이어 형태인 criteo 데이터셋을 스레드 + 힙&우선순위큐로 인위적으로 쪼개 
+impression/click/conversion 3개의 실시간 데이터 들어오는 구조를 흉내내고
+kafka 브로커에 impression/click/conversion 3토픽 저장
+'''
 
 import argparse
 import json
