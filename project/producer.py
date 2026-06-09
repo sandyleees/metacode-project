@@ -17,6 +17,8 @@ import threading
 import time
 from queue import Empty, PriorityQueue
 
+from datetime import datetime
+
 from datasets import load_dataset
 from kafka import KafkaProducer
 from kafka.admin import KafkaAdminClient, NewTopic
@@ -186,6 +188,7 @@ def main():
             'eid':        eid,
             'uid':        uid,
             'timestamp':  ts,
+            'event_time': datetime.fromtimestamp(ts).isoformat(),
             'event_type': "impression",
             'campaign':   cmp,
             'cost':       float(row['cost']) if row['cost'] else 0.0,
@@ -200,6 +203,7 @@ def main():
                 'eid':        eid,
                 'uid':        uid,
                 'timestamp':  ts + click_delay,  # 지연시간 랜덤하게 1~30초
+                'event_time': datetime.fromtimestamp(ts + click_delay).isoformat(),
                 'event_type': "click",
                 'campaign':   cmp,
             }
@@ -224,6 +228,7 @@ def main():
                 'eid':        eid,
                 'uid':        uid,
                 'timestamp':  conv_ts,
+                'event_time': datetime.fromtimestamp(conv_ts).isoformat(),
                 'event_type': "conversion",
                 'campaign':   cmp,
             }
