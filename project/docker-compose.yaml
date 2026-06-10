@@ -116,8 +116,8 @@ services:
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     environment:
       SPARK_NO_DAEMONIZE: "true"
-      SPARK_WORKER_MEMORY: 1g
-      SPARK_WORKER_CORES: 1
+      SPARK_WORKER_MEMORY: 3g
+      SPARK_WORKER_CORES: 3
     depends_on:
       - spark-master
     networks:
@@ -130,8 +130,8 @@ services:
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     environment:
       SPARK_NO_DAEMONIZE: "true"
-      SPARK_WORKER_MEMORY: 1g
-      SPARK_WORKER_CORES: 1
+      SPARK_WORKER_MEMORY: 3g
+      SPARK_WORKER_CORES: 3
     depends_on:
       - spark-master
     networks:
@@ -144,8 +144,8 @@ services:
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
     environment:
       SPARK_NO_DAEMONIZE: "true"
-      SPARK_WORKER_MEMORY: 1g
-      SPARK_WORKER_CORES: 1
+      SPARK_WORKER_MEMORY: 3g
+      SPARK_WORKER_CORES: 3
     depends_on:
       - spark-master
     networks:
@@ -163,6 +163,9 @@ services:
     command: >
       /opt/spark/bin/spark-submit
         --master spark://spark-master:7077
+        --conf spark.cores.max=9
+        --conf spark.executor.cores=1
+        --conf spark.executor.memory=800m
         /app/kafka_to_raw.py
     environment:
       BOOTSTRAP_SERVERS: kafka:29092

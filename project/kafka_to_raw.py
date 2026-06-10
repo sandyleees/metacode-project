@@ -50,16 +50,16 @@ def parse_args():
     parser.add_argument(
         "--s3-raw-base",
         default=os.environ.get("S3_RAW_BASE", "s3a://your-bucket/raw"),
-        help="S3 raw zone 기본 경로 (기본값: S3_RAW_BASE 환경변수 또는 s3a://metacode-criteo-project/raw)",
+        help="S3 raw zone 기본 경로 (기본값: S3_RAW_BASE 환경변수 또는 s3a://your-bucket/raw)",
     )
     parser.add_argument(
         "--checkpoint-base",
-        default=os.environ.get("CHECKPOINT_BASE", "s3a://metacode-criteo-project/checkpoints/kafka_to_raw"),
+        default=os.environ.get("CHECKPOINT_BASE", "s3a://your-bucket/checkpoints/kafka_to_raw"),
         help="Spark 체크포인트 기본 경로 (기본값: CHECKPOINT_BASE 환경변수)",
     )
 
     # ── 스트리밍 동작 제어 ─────────────────────────────────────────────────
-    # 실행 목적에 따라 바뀌는 유일한 파라미터
+    # 실행 목적에 따라 바뀌는 파라미터
     # - latest  (기본): 정상 운영 — 새로 들어오는 메시지만 처리
     # - earliest:       장애 후 재처리(replay) — retention 범위 내 전체 메시지 재소비
     # → 코드 수정 없이 CLI 인자로 전환 가능한 게 핵심 이유
@@ -144,7 +144,7 @@ def write_stream(df, output_path: str, checkpoint_path: str):
     return (
         df.writeStream
         .format("parquet")
-        .outputMode("append") 
+        .outputMode("append")
         .option("path", output_path)
         .option("checkpointLocation", checkpoint_path)
         .partitionBy("raw_date", "raw_hour")
@@ -163,13 +163,9 @@ def main():
     # 1. SparkSession 준비
     # master는 spark-submit --master 로 외부 주입 (코드에 하드코딩 금지)
     #   로컬 테스트: spark-submit --master local[*] kafka_to_raw.py
-    # 토픽 파티션 3개니까 spark worker 3개면 각 파티션 맡아서 병렬처리하는건가?
-    # → 맞음. Kafka readStream은 Kafka 파티션 수만큼 Spark task를 생성
-    #   파티션 3개 → task 3개 → executor 3개 이상이면 완전 병렬
-    #   executor 수 < 파티션 수이면 Spark이 라운드로빈으로 스케줄링
     spark = (
         SparkSession.builder
-        .appName("KafkaToRawFiles")
+        .appName("KafkaToRaw")
         # JAR은 Dockerfile.spark에서 /opt/spark/jars에 직접 배치
         # s3a 설정은 spark-defaults.conf에 고정 (Dockerfile.spark 참고)
         # AWS 자격증명: 코드 하드코딩 금지 → 환경변수(AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY) 사용
@@ -195,20 +191,22 @@ def main():
     # job마다 checkpoint 설정
     # → checkpointLocation을 토픽별로 다른 경로로 지정 필수
     #   같은 경로 공유 시 서로 다른 토픽의 offset 진행 상태가 섞여 재처리 시 누락 또는 중복 발생
-    imp_raw   = read_kafka_topic(spark, args.topic_impression, args.bootstrap_servers, args.starting_offsets)
-    click_raw = read_kafka_topic(spark, args.topic_click,      args.bootstrap_servers, args.starting_offsets)
-    conv_raw  = read_kafka_topic(spark, args.topic_conversion, args.bootstrap_servers, args.starting_offsets)
+    topics = [
+        (args.topic_impression, impression_schema, "impressions"),
+        (args.topic_click,      click_schema,      "clicks"),
+        (args.topic_conversion, conversion_schema, "conversions"),
+    ]
 
-    imp_df   = parse_topic(imp_raw,   impression_schema)
-    click_df = parse_topic(click_raw, click_schema)
-    conv_df  = parse_topic(conv_raw,  conversion_schema)
+    for topic_name, schema, suffix in topics:
+        raw_df = read_kafka_topic(spark, topic_name, args.bootstrap_servers, args.starting_offsets)
+        df     = parse_topic(raw_df, schema)
+        write_stream(
+            df,
+            f"{args.s3_raw_base}/{suffix}",
+            f"{args.checkpoint_base}/{suffix}",
+        )
 
-    # 3. S3에 쓰기 - 각 토픽마다 독립 streaming query 시작
-    write_stream(imp_df,   f"{args.s3_raw_base}/impressions",  f"{args.checkpoint_base}/impressions")
-    write_stream(click_df, f"{args.s3_raw_base}/clicks",       f"{args.checkpoint_base}/clicks")
-    write_stream(conv_df,  f"{args.s3_raw_base}/conversions",  f"{args.checkpoint_base}/conversions")
-
-    # 4. 세 streaming query가 종료될 때까지 main thread 대기
+    # 3. 세 streaming query가 종료될 때까지 main thread 대기
     # awaitAnyTermination(): 3개 쿼리 중 하나라도 종료(에러 or 명시적 stop)되면 main thread 해제
     # 정상 운영 중에는 영구 블로킹 → 컨테이너(프로세스)가 항상 살아있어야 함
     # 컨테이너가 exit하면 YARN/K8s의 supervisor가 재시작 처리
