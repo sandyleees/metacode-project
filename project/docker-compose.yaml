@@ -160,13 +160,31 @@ services:
     # kafka_to_raw.py의 SparkSession 내 .config("spark.jars.packages", ...) 은
     # spark-submit 실행 후 SparkContext가 이미 초기화된 시점에 호출되므로 무시됨
     # JAR 패키지는 SparkContext 생성 전인 --packages 플래그로만 반영 가능
+    # 토픽별 독립 spark-submit 3개를 병렬 실행 (1 container 3 process)
+    # spark.cores.max=3: 프로세스당 worker 1개씩 점유 (3 process × 3 core = worker 9 core 총 사용)
+    # wait: 3개 자식 프로세스 중 하나라도 종료되면 컨테이너도 exit → restart: on-failure가 재시작
     command: >
-      /opt/spark/bin/spark-submit
-        --master spark://spark-master:7077
-        --conf spark.cores.max=9
-        --conf spark.executor.cores=1
-        --conf spark.executor.memory=800m
-        /app/kafka_to_raw.py
+      bash -c "
+        /opt/spark/bin/spark-submit
+          --master spark://spark-master:7077
+          --conf spark.cores.max=3
+          --conf spark.executor.cores=1
+          --conf spark.executor.memory=800m
+          /app/kafka_to_raw.py --topic-type impression &
+        /opt/spark/bin/spark-submit
+          --master spark://spark-master:7077
+          --conf spark.cores.max=3
+          --conf spark.executor.cores=1
+          --conf spark.executor.memory=800m
+          /app/kafka_to_raw.py --topic-type click &
+        /opt/spark/bin/spark-submit
+          --master spark://spark-master:7077
+          --conf spark.cores.max=3
+          --conf spark.executor.cores=1
+          --conf spark.executor.memory=800m
+          /app/kafka_to_raw.py --topic-type conversion &
+        wait
+      "
     environment:
       BOOTSTRAP_SERVERS: kafka:29092
       TOPIC_IMPRESSION: ad-impressions

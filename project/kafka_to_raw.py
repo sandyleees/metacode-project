@@ -1,8 +1,8 @@
 '''
 kafka 브로커에 있는 impression/click/conversion 토픽을
-Spark structured streaming으로 S3 raw에 저장
+Spark structured streaming으로 S3 raw에 저장 (Bronze)
 raw는 Iceberg 테이블이 아니라 append-only 파일 zone으로 둔다.
-기본 포맷은 parquet이며 raw_date / raw_hour 단위로 저장한다.
+기본 포맷은 parquet이며 spark 수집시간 기준 raw_date / raw_hour 단위로 파티션 저장한다.
 '''
 # 멱등성, 예외처리 고려 필요
 # logging? 문제 발생 시 슬랙 등 알림 처리?
@@ -68,6 +68,15 @@ def parse_args():
         default="latest",
         choices=["latest", "earliest"],
         help="스트리밍 시작 offset (기본값: latest / replay 시: earliest)",
+    )
+
+    # ── 단일 토픽 처리 모드 (3-process 구조용) ────────────────────────────
+    # 미지정 시 3개 토픽을 1개 프로세스에서 처리 (하위 호환)
+    parser.add_argument(
+        "--topic-type",
+        choices=["impression", "click", "conversion"],
+        default=None,
+        help="처리할 토픽 종류 (미지정 시 3개 토픽 동시 처리)",
     )
 
     return parser.parse_args()
@@ -191,11 +200,17 @@ def main():
     # job마다 checkpoint 설정
     # → checkpointLocation을 토픽별로 다른 경로로 지정 필수
     #   같은 경로 공유 시 서로 다른 토픽의 offset 진행 상태가 섞여 재처리 시 누락 또는 중복 발생
-    topics = [
+    all_topics = [
         (args.topic_impression, impression_schema, "impressions"),
         (args.topic_click,      click_schema,      "clicks"),
         (args.topic_conversion, conversion_schema, "conversions"),
     ]
+    topic_map = {
+        "impression": all_topics[0],
+        "click":      all_topics[1],
+        "conversion": all_topics[2],
+    }
+    topics = [topic_map[args.topic_type]] if args.topic_type else all_topics
 
     for topic_name, schema, suffix in topics:
         raw_df = read_kafka_topic(spark, topic_name, args.bootstrap_servers, args.starting_offsets)
