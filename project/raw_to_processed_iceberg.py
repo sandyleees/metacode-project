@@ -232,24 +232,26 @@ def transform(imp_df, clk_df, cvt_df, click_window_sec: int, conv_window_sec: in
         col("ingest_ts").alias("conv_ingest_ts"),
     )
 
-    # impression 기준 left join — click/conversion 없어도 impression 행 유지
-    base = (
-        imp.alias("i")
-        .join(clk_slim.alias("c"),  on="eid", how="left")
-        .join(cvt_slim.alias("cv"), on="eid", how="left")
-    )
-
-    # attribution window 적용: impression ingest_ts 기준 각 window 이내 도착한 이벤트만 유효
+    # impression 기준 left join — window 조건을 ON 절에 포함
+    # click/conversion이 window 밖이면 NULL로 처리(impression 행은 유지)
     # click 7일, conversion 30일 — 디지털 광고 업계 표준 (Google, Meta 등 동일 기준)
     # 실습 환경에서는 producer.py 의 conversion_delay_scale / speed_multiplier 와 동일 scale 로 압축
-    base = base.filter(
-        col("c.click_ingest_ts").isNull()
-        | ((col("c.click_ingest_ts").cast("long") - col("i.ingest_ts").cast("long"))
-           .between(0, click_window_sec))
-    ).filter(
-        col("cv.conv_ingest_ts").isNull()
-        | ((col("cv.conv_ingest_ts").cast("long") - col("i.ingest_ts").cast("long"))
-           .between(0, conv_window_sec))
+    base = (
+        imp.alias("i")
+        .join(
+            clk_slim.alias("c"),
+            on=(col("i.eid") == col("c.eid"))
+               & (col("c.click_ingest_ts").cast("long") - col("i.ingest_ts").cast("long"))
+                 .between(0, click_window_sec),
+            how="left",
+        )
+        .join(
+            cvt_slim.alias("cv"),
+            on=(col("i.eid") == col("cv.eid"))
+               & (col("cv.conv_ingest_ts").cast("long") - col("i.ingest_ts").cast("long"))
+                 .between(0, conv_window_sec),
+            how="left",
+        )
     )
 
     return base.select(
