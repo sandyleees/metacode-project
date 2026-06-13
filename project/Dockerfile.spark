@@ -1,3 +1,4 @@
+# 내용 이해 필요 - 우선은 동작에 집중했음.
 FROM apache/spark:3.5.0
 
 USER root
@@ -10,6 +11,7 @@ ENV HADOOP_AWS_VERSION=3.3.4
 ENV AWS_SDK_BUNDLE_VERSION=1.12.262
 ENV KAFKA_CLIENTS_VERSION=3.4.1
 ENV COMMONS_POOL2_VERSION=2.11.1
+ENV ICEBERG_VERSION=1.5.2
 
 RUN cd /opt/spark/jars && \
     wget -q "https://repo1.maven.org/maven2/org/apache/spark/spark-sql-kafka-0-10_${SCALA_MAJOR}/${SPARK_VERSION}/spark-sql-kafka-0-10_${SCALA_MAJOR}-${SPARK_VERSION}.jar" && \
@@ -17,9 +19,16 @@ RUN cd /opt/spark/jars && \
     wget -q "https://repo1.maven.org/maven2/org/apache/kafka/kafka-clients/${KAFKA_CLIENTS_VERSION}/kafka-clients-${KAFKA_CLIENTS_VERSION}.jar" && \
     wget -q "https://repo1.maven.org/maven2/org/apache/commons/commons-pool2/${COMMONS_POOL2_VERSION}/commons-pool2-${COMMONS_POOL2_VERSION}.jar" && \
     wget -q "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar" && \
-    wget -q "https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_BUNDLE_VERSION}/aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar"
+    wget -q "https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_BUNDLE_VERSION}/aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar" && \
+    wget -q "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_${SCALA_MAJOR}/${ICEBERG_VERSION}/iceberg-spark-runtime-3.5_${SCALA_MAJOR}-${ICEBERG_VERSION}.jar" && \
+    # GlueCatalog / S3FileIO 구현체 포함 — iceberg-spark-runtime 에는 없음
+    # AWS SDK를 자체 shade하므로 aws-java-sdk-bundle 과 클래스패스 충돌 없음
+    wget -q "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/${ICEBERG_VERSION}/iceberg-aws-bundle-${ICEBERG_VERSION}.jar"
 
-# s3a:// 접근 설정을 spark-defaults.conf에 고정 — spark-submit --conf 없이도 적용
+# s3a:// 및 Iceberg SQL 확장 — 모든 Spark job에 공통 적용
+# Iceberg 카탈로그(glue_catalog) 설정은 여기서 하지 않음:
+#   raw_to_processed_iceberg.py 가 SparkSession.builder 에서 직접 설정하기 때문
+#   여기서 설정하면 카탈로그 이름 / catalog-impl 불일치로 혼동 유발
 RUN mkdir -p /opt/spark/conf && \
-    echo "spark.hadoop.fs.s3a.impl org.apache.hadoop.fs.s3a.S3AFileSystem" \
-      >> /opt/spark/conf/spark-defaults.conf
+    echo "spark.hadoop.fs.s3a.impl    org.apache.hadoop.fs.s3a.S3AFileSystem" >> /opt/spark/conf/spark-defaults.conf && \
+    echo "spark.sql.extensions        org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions" >> /opt/spark/conf/spark-defaults.conf

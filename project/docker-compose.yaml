@@ -109,8 +109,9 @@ services:
       - lakehouse
 
   # ── Spark Worker × 3 ──────────────────────────────────────────────────────
-  # 토픽 3개 × 파티션 3개 = 9 tasks 완전 병렬
-  # worker당 3코어 × 3worker = 9코어 → 각 StreamingQuery가 독립 executor 3개 점유
+  # worker당 3코어 × 3worker = 9코어 총합
+  # impression/click: 3코어 각각 (파티션 3개 완전 병렬)
+  # conversion: 1코어 (메시지 빈도 가장 적어 단일 executor로 충분) → 절약 2코어를 raw-to-processed 배치에 할당
   spark-worker-1:
     build:
       context: .
@@ -156,8 +157,8 @@ services:
   # ── kafka_to_raw 스트리밍 job (Spark Driver × 3) ─────────────────────────
   # 토픽당 컨테이너 1개 = 프로세스 1개 = spark-submit 1회
   # → 컨테이너 단위 restart: on-failure로 토픽별 독립 재시작
-  # → spark.cores.max=3: 컨테이너당 worker 1개(3코어) 점유
-  #   3컨테이너 × 3코어 = worker 9코어 완전 사용
+  # impression 3코어 + click 3코어 + conversion 1코어 = 7코어
+  # 나머지 2코어 → raw-to-processed 배치 job용으로 예약
 
   x-kafka-to-raw-common: &kafka-to-raw-common
     build:
@@ -220,12 +221,47 @@ services:
     command: >
       /opt/spark/bin/spark-submit
         --master spark://spark-master:7077
-        --conf spark.cores.max=3
+        --conf spark.cores.max=1
         --conf spark.executor.cores=1
         --conf spark.executor.memory=800m
         /app/kafka_to_raw.py --topic-type conversion
     ports:
       - "4042:4040"   # Spark Driver Web UI: http://localhost:4042
+
+  # ── raw_to_processed 일배치 job ────────────────────────────────────────────
+  # profiles: [batch] — docker compose up 시 자동 기동 안 함
+  # 수동 실행: AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... docker compose --profile batch run --rm raw-to-processed
+  # 날짜 범위 재처리: ... run --rm raw-to-processed /opt/spark/bin/spark-submit ... --run-date-start 2024-01-01 --run-date-end 2024-01-07
+  raw-to-processed:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: raw-to-processed
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-ap-northeast-2}
+      AWS_REGION: ${AWS_DEFAULT_REGION:-ap-northeast-2} 
+      S3_RAW_BASE: s3a://metacode-criteo-project/raw
+      GLUE_WAREHOUSE: s3a://metacode-criteo-project/warehouse
+      PYSPARK_PYTHON: python3
+      PYSPARK_DRIVER_PYTHON: python3
+    volumes:
+      - ./:/app
+    command: >
+      /opt/spark/bin/spark-submit
+        --master spark://spark-master:7077
+        --conf spark.cores.max=2
+        --conf spark.executor.cores=1
+        --conf spark.executor.memory=1g
+        /app/raw_to_processed_iceberg.py
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    networks:
+      - lakehouse
+    profiles:
+      - batch
 
 networks:
   lakehouse:

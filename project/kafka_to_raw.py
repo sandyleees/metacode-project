@@ -169,7 +169,7 @@ def main():
     #   아래 awaitAnyTermination()이 main thread를 무한 블로킹 → 컨테이너가 항상 떠 있어야 함
     #   운영에서는 YARN / K8s 이 크래시 감지 후 자동 재시작 처리
 
-    # 1. SparkSession 준비
+    # 1. SparkSession 준비 - 따로 함수로 뺄 수 있을 듯
     # master는 spark-submit --master 로 외부 주입 (코드에 하드코딩 금지)
     #   로컬 테스트: spark-submit --master local[*] kafka_to_raw.py
     spark = (
