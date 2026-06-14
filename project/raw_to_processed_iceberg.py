@@ -53,9 +53,6 @@ def parse_args():
         default=os.environ.get("GLUE_WAREHOUSE", "s3a://your-bucket/warehouse"),
         help="Iceberg warehouse 경로 (Glue catalog 메타스토어가 실제 데이터를 쓰는 S3 경로)",
     )
-    # producer.py 의 --conversion-delay-scale / --speed-multiplier 와 동일 값으로 맞춰야
-    # 실습 환경에서 producer 가 압축해 보낸 지연과 merge window 를 동일 비율로 맞출 수 있음
-    # ex) click 7일 원본 → 7 * 86400 * 0.01 / 100 = 60.5초, conversion 30일 → 259.2초 ≈ 4.3분
     parser.add_argument(
         "--click-window-days",
         type=int,
@@ -67,18 +64,6 @@ def parse_args():
         type=int,
         default=30,
         help="impression 기준 conversion 매칭 최대 일수 (업계 표준: 30일)",
-    )
-    parser.add_argument(
-        "--conversion-delay-scale",
-        type=float,
-        default=0.01,
-        help="producer 와 동일 — merge window 압축 비율 (기본값: 0.01)",
-    )
-    parser.add_argument(
-        "--speed-multiplier",
-        type=int,
-        default=100,
-        help="producer 와 동일 — 전체 타임라인 재생 속도 배수 (기본값: 100)",
     )
     parser.add_argument(
         "--full-refresh",
@@ -235,21 +220,20 @@ def transform(imp_df, clk_df, cvt_df, click_window_sec: int, conv_window_sec: in
     # impression 기준 left join — window 조건을 ON 절에 포함
     # click/conversion이 window 밖이면 NULL로 처리(impression 행은 유지)
     # click 7일, conversion 30일 — 디지털 광고 업계 표준 (Google, Meta 등 동일 기준)
-    # 실습 환경에서는 producer.py 의 conversion_delay_scale / speed_multiplier 와 동일 scale 로 압축
+    # 메시지 timestamp는 Criteo 원본 상대시간 그대로이므로 압축 비율 적용 없이 원본 window 크기 사용
+    # impression/click/conversion 모두 동일 상대시간 축 → 차이값으로 window 판단 가능
     base = (
         imp.alias("i")
         .join(
             clk_slim.alias("c"),
             on=(col("i.eid") == col("c.eid"))
-               & (col("c.click_ingest_ts").cast("long") - col("i.ingest_ts").cast("long"))
-                 .between(0, click_window_sec),
+               & (col("c.click_ts") - col("i.timestamp")).between(0, click_window_sec),
             how="left",
         )
         .join(
             cvt_slim.alias("cv"),
             on=(col("i.eid") == col("cv.eid"))
-               & (col("cv.conv_ingest_ts").cast("long") - col("i.ingest_ts").cast("long"))
-                 .between(0, conv_window_sec),
+               & (col("cv.conv_ts") - col("i.timestamp")).between(0, conv_window_sec),
             how="left",
         )
     )
@@ -318,12 +302,11 @@ def run_merge(spark: SparkSession, staged) -> None:
 def main():
     args = parse_args()
 
-    # attribution window 압축: producer.py 와 동일 scale 적용
-    # click 7일 기본값: 7 * 86400 * 0.01 / 100 = 60.5초
-    # conversion 30일 기본값: 30 * 86400 * 0.01 / 100 = 259.2초 ≈ 4.3분
-    scale = args.conversion_delay_scale / args.speed_multiplier
-    click_window_sec = int(args.click_window_days * 24 * 3600 * scale)
-    conv_window_sec  = int(args.conversion_window_days * 24 * 3600 * scale)
+    # attribution window: 메시지 event timestamp 기준 원본 window 크기 적용
+    # producer 가 전송 타이밍만 압축할 뿐 메시지 timestamp는 Criteo 원본 상대시간 그대로이므로
+    # ingest_ts / kafka_timestamp 기반 압축 window 불필요
+    click_window_sec = args.click_window_days * 24 * 3600
+    conv_window_sec  = args.conversion_window_days * 24 * 3600
 
     spark = build_spark(args.glue_warehouse)
     ensure_table(spark)
