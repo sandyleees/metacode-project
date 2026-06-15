@@ -160,8 +160,14 @@ def main():
     )
     worker.start()  # 스레드 시작
 
-    # impression 전송 시간 압축
-    prev_ts = None  # 처음엔 이전 행이 없으므로 None
+    # Criteo 상대시간 → 현재 실시간 재매핑
+    # real_ts = real_start + (criteo_ts - criteo_base) / speed_multiplier
+    # criteo_base: 첫 이벤트의 Criteo timestamp (기준점)
+    # 이렇게 하면 이벤트 간 상대 간격은 그대로 유지되면서 절대 시각이 현재로 이동
+    # raw_date / event_date 모두 2026년대 날짜가 되어 실제 파이프라인 동작과 동일해짐
+    real_start   = time.time()
+    criteo_base  = None  # 첫 행에서 설정
+    prev_ts      = None
 
     # -------------------------------------------------------------------
 
@@ -174,7 +180,13 @@ def main():
         cmp = int(row['campaign'])
         ts  = int(row['timestamp'])
 
-        # impression 간격 압축
+        if criteo_base is None:
+            criteo_base = ts
+
+        # Criteo 상대시간 → 실시간 변환
+        real_ts = int(real_start + (ts - criteo_base) / args.speed_multiplier)
+
+        # impression 간격 압축 (sleep 타이밍은 Criteo 상대 간격 기준 유지)
         if prev_ts is not None and ts > prev_ts:
         #  ↑ 첫 번째 행은 건너뜀    ↑ 현재가 이전보다 클 때만
             delay = (ts - prev_ts) / args.speed_multiplier
@@ -187,8 +199,8 @@ def main():
         imp_message = {
             'eid':        eid,
             'uid':        uid,
-            'timestamp':  ts,
-            'event_time': datetime.fromtimestamp(ts).isoformat(),
+            'timestamp':  real_ts,
+            'event_time': datetime.fromtimestamp(real_ts).isoformat(),
             'event_type': "impression",
             'campaign':   cmp,
             'cost':       float(row['cost']) if row['cost'] else 0.0,
@@ -198,12 +210,13 @@ def main():
 
         # click 토픽으로 보낼 메시지 - 힙&우선순위큐 저장 후 별도 스레드 전송
         if int(row['click']) == 1:
-            click_delay = rng.randint(1, 30)  # 1~30 사이 정수 랜덤 반환
+            click_delay = rng.randint(1, 30)  # 1~30 사이 정수 랜덤 반환 (Criteo 초 단위)
+            real_click_ts = int(real_start + (ts + click_delay - criteo_base) / args.speed_multiplier)
             click_message = {
                 'eid':        eid,
                 'uid':        uid,
-                'timestamp':  ts + click_delay,  # 지연시간 랜덤하게 1~30초
-                'event_time': datetime.fromtimestamp(ts + click_delay).isoformat(),
+                'timestamp':  real_click_ts,
+                'event_time': datetime.fromtimestamp(real_click_ts).isoformat(),
                 'event_type': "click",
                 'campaign':   cmp,
             }
@@ -224,17 +237,18 @@ def main():
                 continue  # for 루프 다음 행으로 (해당 conversion 스킵해서 중복 conversion 입력 방지)
             seen_conversion_ids.add(conv_id)
 
+            real_conv_ts = int(real_start + (conv_ts - criteo_base) / args.speed_multiplier)
             conv_message = {
                 'eid':        eid,
                 'uid':        uid,
-                'timestamp':  conv_ts,
-                'event_time': datetime.fromtimestamp(conv_ts).isoformat(),
+                'timestamp':  real_conv_ts,
+                'event_time': datetime.fromtimestamp(real_conv_ts).isoformat(),
                 'event_type': "conversion",
                 'campaign':   cmp,
             }
             # 힙으로 추가 -- 소비는 힙을 처리하는 워커 스레드에서(delayed_event_worker)
             # 원본 지연 = 전환 시각(conv_ts) - 노출 시각(timestamp) = 최대 수십일
-            original_delay = max(conv_ts - int(row['timestamp']), 0)
+            original_delay = max(conv_ts - ts, 0)
                 # 압축: 원본 지연 * conversion_delay_scale / speed_multiplier
                 # ex) 원본 3600초 지연 → 3600 * 0.01 / 100 = 0.36초 후 발행
             send_at = time.time() + (
