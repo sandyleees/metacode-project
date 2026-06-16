@@ -263,6 +263,40 @@ services:
     profiles:
       - batch
 
+  # ── processed_to_campaign_summary 일배치 job (Gold) ────────────────────────
+  # profiles: [batch] — docker compose up 시 자동 기동 안 함
+  # 수동 실행: AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... docker compose --profile batch run --rm processed-to-summary
+  # 날짜 지정 재처리: ... run --rm processed-to-summary /opt/spark/bin/spark-submit ... --run-date-end 2026-06-07
+  processed-to-summary:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark
+    container_name: processed-to-summary
+    environment:
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-ap-northeast-2}
+      AWS_REGION: ${AWS_DEFAULT_REGION:-ap-northeast-2}
+      GLUE_WAREHOUSE: s3a://metacode-criteo-project/warehouse
+      PYSPARK_PYTHON: python3
+      PYSPARK_DRIVER_PYTHON: python3
+    volumes:
+      - ./:/app
+    command: >
+      /opt/spark/bin/spark-submit
+        --master spark://spark-master:7077
+        --conf spark.cores.max=2
+        --conf spark.executor.cores=1
+        --conf spark.executor.memory=1g
+        /app/processed_to_campaign_summary.py
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    networks:
+      - lakehouse
+    profiles:
+      - batch
+
 networks:
   lakehouse:
     driver: bridge
