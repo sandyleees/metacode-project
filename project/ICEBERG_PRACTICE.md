@@ -1,7 +1,7 @@
-# Iceberg 스냅샷 / Time Travel / Rollback 실습 기록
+# Iceberg 실습 기록 — 스냅샷 / Time Travel / Rollback / Compaction / MOR
 
-> 2026-06-16, 빈 S3/Glue 상태에서 전체 파이프라인(Bronze→Silver→Gold)을 가동해
-> 스냅샷을 누적시킨 뒤, 의도적 장애 → time travel → rollback까지 복구한 실습 로그.
+> 2026-06-16~18, 빈 S3/Glue 상태에서 전체 파이프라인(Bronze→Silver→Gold)을 가동해
+> 스냅샷 누적 → 장애/복구 → Compaction → MOR까지 실습한 로그.
 > 모든 SQL은 `run_sql.py`(ad-hoc Iceberg/Glue 실행기, 본 실습에서 신규 작성)로 실행.
 > 구체적인 실행 명령어, S3 버킷 상태, 로그 상태 캡쳐 사진은 notion에 별도 기록
 
@@ -115,13 +115,6 @@ aws s3 ls s3://metacode-criteo-project/warehouse/gold.db/campaign_summary/metada
 
 ```sql
 DROP TABLE glue_catalog.gold.campaign_summary;  -- 깨진 카탈로그 항목 제거 (0건이라 손실 없음)
--- "깨진 카탈로그 항목"이란, "우리가 원하는 진짜 과거 데이터 이력(Lineage)이 전부 잘려 나간 채, 껍데기(0건짜리 새 테이블)만 등록되어 있는 상태"
-
--- 과거 상태 (진짜 데이터): 스냅샷 계보가 1번 → 2번 → 3번(6642..., 658건)으로 예쁘게 이어져 있었습니다.
-
--- DROP 수행 후: AWS Glue Catalog(또는 우리 카탈로그)에서 gold.campaign_summary라는 이름표를 기존 스냅샷 계보로부터 완전히 떼어내 버렸습니다.
-
--- 재생성 후 (현재 상태): 데이터가 0건인 완전히 새로운 족보(스냅샷 ID 새로 생성, 부모 ID 없음)를 가진 껍데기 테이블을 만들고, 거기에 다시 gold.campaign_summary라는 이름표를 붙였습니다.
 
 CALL glue_catalog.system.register_table(
   'gold.campaign_summary',
@@ -392,7 +385,132 @@ SELECT count(*) FROM glue_catalog.gold.campaign_summary;    -- 658 (변동 없�
   줄이고 "지금 보이는 데이터"는 보존한다.
 - 컨테이너(`spark-master`, `spark-worker-1`) 정리 완료.
 
-## 8. 사용한 도구
+## 8. Compaction 실습 — 실습 환경
+
+**목표**: 컴팩션 전후 파일 통계 비교, bin-pack vs sort 전략 비교 (파일 크기 / 쿼리 성능 / file pruning).
+
+**실습 테이블**: 운영 테이블(`silver.processed_events`) 대신 CTAS로 별도 테이블 3개 생성.
+- `lab_before` (컴팩션 없음, 비교 기준)
+- `lab_binpack` (bin-pack 적용)
+- `lab_sort` (sort 적용)
+- 각 테이블: `CREATE TABLE ... AS SELECT * FROM silver.processed_events` + `INSERT INTO × 4` → **소파일 5개**
+
+**binpack target 설정 학습**:
+bin-pack은 "bin 총 크기 ≤ target"으로 bins를 구성한다. 각 파일이 5.16MB일 때 target=10MB를 설정하면 `5.16 + 5.16 = 10.32MB > 10MB`이므로 두 파일을 합칠 수 없어 각각 단독 bin이 된다(5→5, 파일 수 변화 없음). sort는 전체 재정렬 후 target 크기씩 잘라 쓰는 방식이라 동일 조건에서도 5→3이 된다.
+
+bin-pack과 sort를 동일 파일 수로 맞춰야 file pruning 효과만 비교할 수 있으므로, `5.16 × 2 = 10.32MB`를 수용하는 **target=11MB**로 설정 → binpack/sort 모두 5→3.
+
+**초기 상태**: 각 테이블 **5파일 / 1,399,335행 / 25.19MB / 5,159KB 평균** — 3테이블 동일
+
+## 9. Compaction 전후 비교 결과
+
+### 파일 통계
+
+| 단계 | 파일 수 | 총 크기 | 평균 파일 크기 |
+|---|---|---|---|
+| before (3테이블 공통) | 5개 | 25.19 MB | 5,159 KB |
+| binpack (target=11MB) | **3개** | 22.84 MB | 7,795 KB |
+| sort (target=11MB, campaign ASC) | **3개** | **12.65 MB** | 4,318 KB |
+
+**컴팩션 CALL**:
+```sql
+-- bin-pack
+CALL glue_catalog.system.rewrite_data_files(
+  table => 'silver.lab_binpack',
+  strategy => 'binpack',
+  options => map('target-file-size-bytes', '11534336')
+);
+-- rewritten=5, added=3
+
+-- sort (campaign 기준 정렬)
+CALL glue_catalog.system.rewrite_data_files(
+  table => 'silver.lab_sort',
+  strategy => 'sort',
+  sort_order => 'campaign ASC NULLS LAST, event_date ASC',
+  options => map('target-file-size-bytes', '11534336')
+);
+-- rewritten=5, added=3
+```
+
+### 쿼리 성능 (`WHERE campaign = '30801593'`, COUNT + SUM)
+
+| 단계 | 쿼리 시간 |
+|---|---|
+| before (5파일) | 16.1s |
+| binpack (3파일) | 15.7s |
+| sort (3파일) | **13.7s** |
+
+### 분석
+
+**왜 sort가 binpack보다 총 파일 크기가 절반인가**:
+sort는 campaign 기준 전체 재정렬 후 Parquet으로 쓰기 때문에, 같은 campaign 값들이 파일 내에서 연속으로 나열된다. Parquet의 dictionary encoding / RLE 압축 효율이 크게 향상 → 같은 행 수임에도 파일 크기가 줄어든다.
+
+> **실습 환경 한계**: 동일 데이터를 5번 INSERT한 환경이라 sort 후 압축률이 과장됨(25MB→12MB, 절반 감소). 실제 운영 데이터(매일 다른 이벤트가 쌓이는 경우)에서는 10~30% 수준의 감소가 일반적이며, sort의 핵심 이점은 크기 감소가 아니라 **file pruning**.
+
+**binpack vs sort의 file pruning 차이**:
+`$files`의 `lower_bounds` / `upper_bounds`로 확인:
+- **binpack**: 3개 파일 모두 동일한 campaign 범위 (전체 범위) → campaign 필터 쿼리 시 3개 파일 전부 스캔
+- **sort**: 3개 파일이 각각 다른 campaign 범위를 가짐 → campaign 필터 쿼리 시 해당 범위 포함 파일만 스캔, 나머지 skip 가능
+
+> EXPLAIN 플랜 레벨에서는 binpack/sort 모두 동일하게 `BatchScan ... filters=campaign = 30801593`으로 표시됨. file pruning은 Iceberg scan planning 단계(플랜 이후 실행 시점)에서 column statistics를 이용해 파일을 제외하므로 EXPLAIN에 반영되지 않음. 실제 pruning 여부는 Spark UI의 `numFiles`로 확인 가능.
+
+## 10. MOR 실습 — `rewrite_position_delete_files` 전후 content 분포 비교
+
+**목표**: MOR 모드에서 UPDATE가 내부적으로 어떻게 파일을 생성하는지 확인하고, `rewrite_position_delete_files`로 position delete file을 합치는 과정을 `$files.content` 분포로 비교.
+
+**실습 테이블**: CTAS로 `silver.lab_mor` 생성
+```sql
+CREATE TABLE glue_catalog.silver.lab_mor
+  USING iceberg
+  PARTITIONED BY (event_date)
+  TBLPROPERTIES (
+    'format-version'='2',
+    'write.delete.mode'='merge-on-read',
+    'write.update.mode'='merge-on-read'
+  )
+  AS SELECT * FROM glue_catalog.silver.processed_events
+```
+
+**MOR UPDATE 내부 동작**:
+
+MOR에서 UPDATE는 내부적으로 **DELETE + 새 data file 추가**로 처리된다:
+- 기존 row를 무효화하는 **positional delete file** (content=1) 생성 — "어떤 row를 읽지 마라"는 위치 마커
+- update된 새 값을 담은 **새 data file** (content=0) 생성
+
+content=1은 update된 새 값이 아니라, **무효화된 기존 row의 위치(file_path + pos)**를 기록한다. 실제 새 값은 content=0 파일에 있다.
+
+**UPDATE × 5회 실행 후 before 상태**:
+
+```sql
+UPDATE glue_catalog.silver.lab_mor SET cost = cost * 1.1 WHERE campaign = '30801593';
+-- × 5회 (각기 다른 campaign)
+```
+
+| content | 의미 | 파일 수 | record_count | total_kb |
+|---|---|---|---|---|
+| 0 | DATA (원본 1 + UPDATE 새 data 5) | 6 | 325,604 | 6,070.0 |
+| 1 | POSITION_DELETES | 5 | 45,737 | 65.1 |
+
+**`rewrite_position_delete_files` 실행**:
+
+```sql
+CALL glue_catalog.system.rewrite_position_delete_files(table => 'silver.lab_mor')
+-- rewritten_delete_files_count=5, added_delete_files_count=1
+```
+
+**after 상태**:
+
+| content | 파일 수 | record_count | total_kb |
+|---|---|---|---|
+| 0 | 6 (변화 없음) | 325,604 | 6,070.0 |
+| 1 | **1** (5→1) | 45,737 | 51.5 |
+
+**결론**:
+- `rewrite_position_delete_files`는 **content=0(data file)은 전혀 건드리지 않고** position delete file(content=1)만 5→1로 합쳤다.
+- delete file이 줄어들면 쿼리 시 merge 비용이 감소한다 (data file과 delete file을 겹쳐 읽는 횟수 감소).
+- content=1 파일이 남아있으므로 완전한 정리가 필요하다면 `rewrite_data_files`를 추가로 실행해 delete file을 data file에 흡수시켜야 한다.
+
+## 11. 사용한 도구
 
 - `run_sql.py` (신규): `glue_catalog` + Iceberg 확장을 로드한 SparkSession으로 임의 SQL/`CALL` 프로시저를
   spark-submit으로 즉석 실행하는 ad-hoc 러너. `health-queries/*.sql` 실행기로도 재사용 가능.
@@ -401,10 +519,3 @@ SELECT count(*) FROM glue_catalog.gold.campaign_summary;    -- 658 (변동 없�
     /opt/spark/bin/spark-submit --master spark://spark-master:7077 \
     --conf spark.cores.max=1 /app/run_sql.py --sql "<SQL 또는 CALL 문>"
   ```
-
-## 9. 최종 상태 / 인프라
-
-- 실습 종료 시점 데이터: `silver.processed_events` 279,867건(9 스냅샷), `gold.campaign_summary` 658건(정상 복구 완료, 4 스냅샷 중 HEAD는 3번째).
-- 비용 절감을 위해 모든 docker 컨테이너(`docker compose down`) 정리 완료 — S3/Glue 데이터는 보존.
-- 재가동: `docker compose up -d zookeeper kafka producer spark-master spark-worker-1 spark-worker-2 spark-worker-3` 후
-  `kafka-to-raw-*` 및 batch profile 서비스 필요 시 추가 기동.
