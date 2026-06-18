@@ -190,7 +190,209 @@ SELECT count(*) FROM glue_catalog.gold.campaign_summary;  -- 658 ✅ 복구 완�
 - 사고 스냅샷의 `is_current_ancestor`가 `true → false`로 바뀌어 "한때 HEAD였지만 현재 체인의 조상은 아님"을 표시한다.
 - **"무슨 일이 있었나"는 `$snapshots`, "지금 무엇이 유효한가/언제 바뀌었나"는 `$history`**로 구분해서 봐야 한다.
 
-## 6. 사용한 도구
+## 6. 의도적 고아 파일(orphan file) 생성 → `remove_orphan_files` 실습
+
+**목표**: 고아 파일을 의도적으로 만들고 `CALL glue_catalog.system.remove_orphan_files(...)`로
+dry-run → 실제 삭제 → 삭제 확인까지 재현.
+
+**1단계 — 고아 파일 생성**: 어떤 Iceberg 매니페스트에도 등록되지 않은 파일을 테이블 데이터 경로에 직접 업로드.
+
+```bash
+aws s3 cp orphan_test.parquet \
+  s3://metacode-criteo-project/warehouse/silver.db/processed_events/data/event_date=2026-06-16/orphan_test_manual.parquet
+# LastModified: 2026-06-17 03:15:49 (KST) = 2026-06-16 18:15:49 (UTC)
+```
+
+**2단계 — dry-run 시도 → 24시간 가드로 막힘**:
+
+```sql
+CALL glue_catalog.system.remove_orphan_files(
+  table => 'silver.processed_events',
+  older_than => TIMESTAMP '2030-01-01 00:00:00',  -- 충분히 미래로 잡아도
+  dry_run => true
+)
+-- IllegalArgumentException: Cannot remove orphan files with an interval less than 24 hours.
+```
+
+**원인 — 진짜 안전장치, SQL 표현식으로 우회 불가**:
+- 이 검증은 `RemoveOrphanFilesProcedure` 내부에 하드코딩된 Java 레벨 체크다. `older_than`을
+  `TIMESTAMP` 리터럴로 주든 `current_timestamp() - INTERVAL 1 minute`로 주든, **"지금 시각과
+  `older_than`의 차이가 24시간 미만이면" 무조건 거부**된다 — SQL 파싱이나 표현식 종류와 무관.
+- 더 근본적으로, 24시간 조건을 만족시키려고 `older_than`을 `now() - 25h`처럼 충분히 과거로
+  잡으면, 방금(몇 분 전) 만든 테스트 고아 파일은 그 cutoff보다 *더 최신*이라 후보 목록에서
+  자동으로 빠진다. 즉 **"24시간 조건 통과"와 "방금 만든 파일이 후보에 잡힘"은 동시에 만족 불가능**
+  — 둘 다 만족하는 SQL 조합 자체가 없다.
+- 이 가드는 운영에서도 똑같이 동작한다: 방금 실패한 job이 남긴 파일을 절차(CALL)로 당장 지우고
+  싶어도 24시간을 기다려야 한다. 에러 메시지가 안내하는 "Action API"(`SparkActions.get(spark)
+  .deleteOrphanFiles(table)`)를 Java/Scala 또는 py4j로 직접 호출하면 이 가드를 우회할 수 있지만,
+  동시 쓰기 작업과 충돌 위험이 있어 운영에서는 권장되지 않는 경로다.
+
+**3단계 — 24시간 경과 후 정식 절차 실행 (2026-06-18)**:
+
+`older_than` 계산:
+- 현재 UTC: 2026-06-18 01:15 / 파일 생성 UTC: 2026-06-16 18:15:49
+- 선택값 `2026-06-17 01:00:00 UTC`: 파일보다 나중(후보 포함 ✅), 현재와의 차이 25h 15m(가드 통과 ✅)
+
+**silver dry-run**:
+```sql
+CALL glue_catalog.system.remove_orphan_files(
+  table => 'silver.processed_events',
+  older_than => TIMESTAMP '2026-06-17 01:00:00',
+  dry_run => true
+)
+-- orphan_file_location:
+-- s3a://.../data/event_date=2026-06-16/orphan_test_manual.parquet  ← 1건, 정상 데이터 파일은 목록에 없음
+```
+
+**silver 실제 삭제** (`dry_run => false`) → 동일한 1건 반환 (삭제된 파일 목록).
+
+**gold dry-run + 실제 삭제**:
+```sql
+CALL glue_catalog.system.remove_orphan_files(
+  table => 'gold.campaign_summary',
+  older_than => TIMESTAMP '2026-06-17 01:00:00',
+  dry_run => true / false
+)
+```
+
+예상(2개)보다 3개 잡힘:
+
+| 파일 | 원인 |
+|---|---|
+| `00000-e037ee15-...metadata.json` | 3절 `--full-refresh` 사고로 만들어진 "B" 빈 테이블 잔재 |
+| `00001-97046099-...metadata.json` | 동일 사고 잔재 |
+| `snap-2722245930522195833-1-...avro` | `register_table` 복구 과정에서 체인에서 이탈한 manifest list |
+
+**4단계 — S3 삭제 검증**:
+```bash
+# silver: orphan_test_manual.parquet 사라지고 정상 데이터 파일만 잔존
+aws s3 ls .../silver.db/processed_events/data/event_date=2026-06-16/
+# → 00000-99-0c2409c6-...parquet (정상 파일만 남음) ✅
+
+# gold: 세 orphan 파일 모두 사라짐 (grep 결과 없음) ✅
+```
+
+**데이터 무결성 확인**:
+```sql
+SELECT count(*) FROM glue_catalog.silver.processed_events;  -- 279,867 (변동 없음) ✅
+SELECT count(*) FROM glue_catalog.gold.campaign_summary;    -- 658 (변동 없음) ✅
+```
+
+**결론**:
+- `remove_orphan_files`는 **Iceberg 메타데이터 체인에 연결되지 않은 파일만 골라 삭제**한다 — 현재 활성 스냅샷이 참조하는 정상 데이터 파일은 `older_than` 기준을 만족해도 건드리지 않았음.
+- 24시간 가드는 SQL 레벨에서 우회 불가 — `older_than` 값과 관계없이 `now() − older_than < 24h`이면 거부된다. 운영 maintenance에서는 "매일 새벽 3시에 어제 이전 파일 정리" 패턴으로 자연스럽게 통과.
+- `expire_snapshots`와 역할 분리: `expire_snapshots`는 Iceberg가 알고 있는 스냅샷 체인 내 미참조 파일을 지우고, `remove_orphan_files`는 체인 자체가 끊긴(메타데이터에 전혀 기록 안 된) 파일을 지운다 — 둘 다 실행해야 S3가 완전히 정리된다.
+
+## 7. `expire_snapshots` 실습 — 스냅샷 + 미참조 물리 파일 삭제 전후 비교
+
+**목표**: 1절에서 누적된 스냅샷(silver 9개, gold 4개)을 `expire_snapshots`로 정리하면서,
+"카탈로그 메타데이터에서 스냅샷 항목만 지워지는 것"이 아니라 **그 스냅샷만 참조하던 실제
+S3 데이터/메타데이터 파일까지 물리적으로 삭제**되는지 `data/`·`metadata/` 디렉토리를 분리해서
+전후 비교로 확인.
+
+> 처음에 디렉토리 구분 없이 테이블 전체 합산 용량(`--summarize`)만 봤다가, "데이터 파일이
+> 줄었는지 메타데이터만 줄었는지 구분이 안 된다"는 피드백으로 `data/`와 `metadata/`를 나눠
+> 다시 측정함.
+
+**Before**:
+
+| 테이블 | data/ 객체수 | data/ 용량 | metadata/ 객체수 | metadata/ 용량 |
+|---|---|---|---|---|
+| silver.processed_events | 10 | 19,726,510 B | 36 | 278,828 B |
+| gold.campaign_summary | 3 | 123,874 B | 19 | 124,928 B |
+
+(스냅샷 수: silver 9개, gold 4개 — 1절·5절과 동일)
+
+**실행**:
+
+```sql
+-- silver: 과거 8개 스냅샷 전부 만료, 현재 HEAD만 유지
+CALL glue_catalog.system.expire_snapshots(
+  table => 'silver.processed_events',
+  older_than => TIMESTAMP '2026-06-16 20:04:30',  -- 실행 시점 = "지금"
+  retain_last => 1
+)
+-- deleted_data_files_count=8, deleted_manifest_files_count=15,
+-- deleted_manifest_lists_count=8 (총 31개 파일)
+
+-- gold: 과거 3개 스냅샷 전부 만료
+CALL glue_catalog.system.expire_snapshots(
+  table => 'gold.campaign_summary',
+  older_than => TIMESTAMP '2026-06-16 20:05:45',
+  retain_last => 1
+)
+-- deleted_data_files_count=2, deleted_manifest_files_count=4,
+-- deleted_manifest_lists_count=3 (총 9개 파일)
+```
+
+- `older_than`을 운영값(30일 전)이 아니라 **실행 시점**으로 잡은 이유: 모든 스냅샷이 실습 중
+  몇 시간 안에 생성된 것이라 30일 기준으로는 아무것도 안 지워짐 — 효과를 보려면 일부러 "지금"을
+  기준으로 잡아야 함.
+- `retain_last => 1`: 현재 HEAD 스냅샷 1개만 남기고 나머지를 전부 만료 대상으로 — 전후 비교
+  효과를 가장 뚜렷하게 보여주기 위한 선택 (운영에서는 더 보수적인 값을 쓰는 게 일반적).
+
+**After**:
+
+| 테이블 | data/ 객체수 | data/ 용량 | metadata/ 객체수 | metadata/ 용량 |
+|---|---|---|---|---|
+| silver.processed_events | 2 (−8) | 5,283,605 B (−73.2%) | 14 (−22) | 118,134 B (−57.6%) |
+| gold.campaign_summary | 1 (−2) | 48,840 B (−60.6%) | 13 (−6) | 82,000 B (−34.4%) |
+
+스냅샷 수: silver 9 → **1**, gold 4 → **1**.
+
+**검증 1 — `metadata/` 객체 수 변화 재구성 (36→14, 19→13인 이유)**:
+
+처음엔 `metadata/` 객체 수 감소분(silver −22, gold −6)이 procedure가 보고한 삭제 수
+(silver 15+8=23, gold 4+3=7)와 1씩 안 맞아서 의아했음. `*.metadata.json` 버전 파일 목록을
+직접 찍어서(`aws s3 ls ... | grep metadata.json`) 확인한 결과:
+
+| | metadata.json 개수 | manifest+manifest-list 개수 |
+|---|---|---|
+| silver before→after | 10 → **11** (+1) | 26 → 3 (**−23**, procedure 보고값과 정확히 일치) |
+| gold before→after | 8 → **9** (+1) | 11 → 4 (**−7**, procedure 보고값과 정확히 일치) |
+
+**원인**: `expire_snapshots` 자체도 "테이블의 스냅샷 목록이 바뀌는 커밋"이라서, 실행할 때마다
+새 `metadata.json` 버전 파일을 1개 추가한다(silver `00010-...json` @ 05:04:50, gold
+`00006-...json` @ 05:06:59 — 두 expire 호출 직후 시각과 일치). 즉 순변화 = `−(매니페스트+매니페스트리스트 삭제 수) + 1(새 metadata.json)`
+이라서 procedure 보고값보다 정확히 1만큼 적게 줄어든 것처럼 보인 것 — **스냅샷 GC와 메타데이터
+버전 파일 GC는 서로 다른 메커니즘**이고, 후자는 `expire_snapshots`가 만들지언정 지우지는 않는다
+(`write.metadata.delete-after-commit.enabled` 별도 설정 없이는 과거 `metadata.json` 영구 보존).
+
+**검증 2 — 보너스 발견: gold에 진짜 orphan metadata.json 잔재 확인**:
+
+gold의 `metadata.json` 목록을 시간순으로 찍어보니 `00000`/`00001`이 두 번 등장:
+
+```
+00003-9fe819f4...  15:52:38   ← 3절 사고 직전 정상 상태 (register_table로 복구한 지점)
+00000-e037ee15...  16:15:19   ← 3절 --full-refresh 사고로 만들어진 "B"(빈 테이블)의 잔재
+00001-97046099...  16:15:22   ← 같은 사고의 잔재
+00004-7de85fe7...  16:40:29   ← 정상 체인 계속
+```
+
+`00000-e037ee15`/`00001-97046099`는 3절에서 DROP+재생성된 뒤 `register_table`로 버려진
+"B" 테이블의 metadata.json이다. 현재 테이블의 metadata-log 체인(00003→00004→...)에 걸려있지
+않아 `expire_snapshots`가 손대지 않았고 지금도 S3에 남아있는 **진짜 orphan**이다 — 6절에서
+수동으로 심은 테스트 orphan과는 별개로, **3절 사고가 실제로 남긴 orphan 잔재**. 6절의
+`remove_orphan_files` 실습(24시간 경과 후 재개 예정)을 돌릴 때 이 두 파일도 같이 잡혀 삭제되는지
+확인 대상에 추가.
+
+**검증 3 — 현재 데이터는 영향 없음**:
+```sql
+SELECT count(*) FROM glue_catalog.silver.processed_events;  -- 279,867 (변동 없음)
+SELECT count(*) FROM glue_catalog.gold.campaign_summary;    -- 658 (변동 없음)
+```
+
+**결론**:
+- `expire_snapshots`는 단순 "카탈로그 정리"가 아니라 만료된 스냅샷이 독점 참조하던 data file /
+  manifest / manifest list를 실제로 S3에서 지우는 진짜 GC다.
+- 동시에 `expire_snapshots` 실행 자체가 새 `metadata.json` 버전을 추가하므로, "지운 파일 수"와
+  "디렉토리 객체 수 감소분"은 정확히 일치하지 않는다 — 비교 시 `metadata.json` 개수 변화를
+  따로 떼어서 봐야 procedure 보고값과 정확히 맞아떨어진다.
+- 현재 HEAD가 참조하는 데이터는 전혀 건드리지 않음(행 수 불변) — "과거로 돌아갈 수 있는 능력"만
+  줄이고 "지금 보이는 데이터"는 보존한다.
+- 컨테이너(`spark-master`, `spark-worker-1`) 정리 완료.
+
+## 8. 사용한 도구
 
 - `run_sql.py` (신규): `glue_catalog` + Iceberg 확장을 로드한 SparkSession으로 임의 SQL/`CALL` 프로시저를
   spark-submit으로 즉석 실행하는 ad-hoc 러너. `health-queries/*.sql` 실행기로도 재사용 가능.
@@ -200,7 +402,7 @@ SELECT count(*) FROM glue_catalog.gold.campaign_summary;  -- 658 ✅ 복구 완�
     --conf spark.cores.max=1 /app/run_sql.py --sql "<SQL 또는 CALL 문>"
   ```
 
-## 7. 최종 상태 / 인프라
+## 9. 최종 상태 / 인프라
 
 - 실습 종료 시점 데이터: `silver.processed_events` 279,867건(9 스냅샷), `gold.campaign_summary` 658건(정상 복구 완료, 4 스냅샷 중 HEAD는 3번째).
 - 비용 절감을 위해 모든 docker 컨테이너(`docker compose down`) 정리 완료 — S3/Glue 데이터는 보존.
