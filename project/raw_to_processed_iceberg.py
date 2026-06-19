@@ -167,12 +167,17 @@ def ensure_table(spark: SparkSession) -> None:
         PARTITIONED BY (event_date)
         TBLPROPERTIES (
             'format-version'                = '2',
-            'write.update.mode'             = 'copy-on-write',
-            'write.merge.mode'              = 'copy-on-write',
-            'write.delete.mode'             = 'copy-on-write',
+            'write.merge.mode'              = 'merge-on-read',
             'write.target-file-size-bytes'  = '134217728'
         )
     """)
+    # write.merge.mode MOR: MERGE INTO 구문 전체에 적용.
+    #   WHEN NOT MATCHED INSERT → 항상 append, COW/MOR 무관.
+    #   WHEN MATCHED UPDATE    → MOR는 delta 파일만 append (COW는 파일 전체 재작성).
+    #   광고 데이터 특성상 UPDATE 대상(click/conversion)은 전체 impression의 <2% → MOR 효과 큼.
+    #   읽기 시 base+delta 병합 오버헤드는 daily compaction(maintenance.sh)이 흡수.
+    # write.update.mode / write.delete.mode 미설정:
+    #   standalone UPDATE/DELETE 구문이 없으므로 불필요.
 
 
 def read_raw(spark: SparkSession, base: str, event_type: str,
@@ -315,68 +320,66 @@ def run_attribution_stage(
     cvt_df,
     click_window_sec: int,
     conv_window_sec: int,
-    run_date_end: str,
 ) -> None:
-    # Stage 2: 오늘 raw에 도착한 click/conversion → Silver에서 매칭 impression 찾아 MERGE UPDATE
-    # impression이 며칠 전 raw_date에 있어도 이미 Stage 1에서 Silver에 올라가 있으므로 join 가능
+    # Stage 2: 오늘 raw에 도착한 click/conversion → Silver에서 eid로 매칭되는 impression 행에 MERGE UPDATE
+    # impression은 Stage 1에서 이미 Silver에 올라가 있으므로 raw_date와 무관하게 join 가능.
+    # lookback 기준은 각 행의 event_time(c.timestamp / cv.timestamp) — ingest_ts(run_date_end) 축이 아님.
+    # 수집 지연이 있어도 실제 발생 시각 기준 window를 정확히 판정하기 위해 per-row로 계산.
     clk = dedup(clk_df, "eid")
     cvt = dedup(cvt_df, "eid")
 
-    # [파티션 pruning] Silver에서 읽을 파티션 범위 제한 — 성능 최적화
-    # 오늘 수집된 click이 매칭할 수 있는 impression은 최대 click_window_days(7일) 전까지.
-    # 그 이전 event_date 파티션은 어차피 join에서 걸러지므로 Iceberg 파티션 자체를 열지 않음.
-    # producer가 real timestamp를 사용하므로 Silver event_date와 run_date_end가 같은 시간축(2026년대).
-    #
-    # [주의] run_date_end는 click 수집 날짜 기준이고 click.timestamp는 이벤트 발생 날짜 기준.
-    # 수집 지연이 크면(click이 며칠 뒤에 수집) 파티션 필터가 유효 impression 파티션을 제외할 수 있음.
-    # 현재 producer는 발행 즉시 수집되므로 click.event_time ≈ raw_date, 실질적 누락 없음.
-    # 수집 지연이 발생하는 환경에서는 click.agg(min("timestamp"))로 lookback을 정확히 계산해야 함.
-    click_lookback = (
-        date.fromisoformat(run_date_end) - timedelta(seconds=click_window_sec)
-    ).isoformat()
-    conv_lookback = (
-        date.fromisoformat(run_date_end) - timedelta(seconds=conv_window_sec)
-    ).isoformat()
+    silver = spark.table(FULL_NAME)
 
-    silver_for_click = spark.table(FULL_NAME).filter(col("event_date") >= click_lookback)
-    silver_for_conv  = spark.table(FULL_NAME).filter(col("event_date") >= conv_lookback)
-
-    # [attribution 비즈니스 로직] click이 impression 발생 후 window 내에 일어났는지 초 단위 판정
-    # click 7일, conversion 30일 — 디지털 광고 업계 표준 (Google, Meta 등 동일 기준)
-    # 파티션 pruning(위)이 날짜 단위 사전 필터라면, 이 조건이 실제 attribution 판정 기준.
-    # ≥ 0: click이 impression보다 나중 발생 (순서 보장)
-    # ≤ window_sec: impression 발생 후 window 이내
-    # event_time.cast("long") → unix 초, clk.timestamp도 unix 초 → 단위 동일
+    # --- click attribution ---
     click_updates = (
         clk.alias("c")
         .join(
-            silver_for_click.alias("s"),
+            silver.alias("s"),
+            # 조건 1: eid 일치 — 이 click이 어느 impression에서 발생했는지 특정
             (col("c.eid") == col("s.event_id"))
-            & (col("c.timestamp") - col("s.event_time").cast("long")).between(0, click_window_sec),
+            # 조건 2: attribution window 판정 (비즈니스 로직)
+            #   c.timestamp - s.event_time: click이 impression보다 얼마나 나중인지 (초)
+            #   >= 0: click은 반드시 impression 이후 발생 (순서 보장)
+            #   <= click_window_sec: impression 후 7일 이내 — 디지털 광고 업계 표준
+            #   양쪽 모두 unix 초 단위: c.timestamp(LongType), event_time.cast("long")
+            & (col("c.timestamp") - col("s.event_time").cast("long")).between(0, click_window_sec)
+            # 조건 3: Silver event_date 파티션 pruning 힌트 (성능)
+            #   조건 2에서 c.timestamp - s.event_time <= click_window_sec 이면 조건 3도 항상 성립 — 논리적 중복.
+            #   단, 조건 2는 두 동적 컬럼의 연산이라 Iceberg가 스캔 전 파티션 제거에 쓰기 어려움.
+            #   조건 3은 파티션 키(event_date)를 직접 비교하므로 Spark DFP가 인식해 불필요한 파티션 열기를 차단.
+            #   (c.timestamp - click_window_sec).cast("timestamp"): click 기준 window 하한을 unix 초 → Timestamp
+            #   to_date(...): Timestamp → DATE (Silver event_date 파티션 키 타입과 일치)
+            & (col("s.event_date") >= to_date((col("c.timestamp") - click_window_sec).cast("timestamp"))),
             how="inner",
         )
-        .select(col("s.event_id"))
+        # event_date를 함께 전달 → MERGE ON 절에서 파티션 키로 타겟 pruning
+        .select(col("s.event_id"), col("s.event_date"))
     )
     click_updates.createOrReplaceTempView("click_updates")
     spark.sql(f"""
         MERGE INTO {FULL_NAME} t
         USING click_updates s
-        ON t.event_id = s.event_id
+        ON t.event_id = s.event_id AND t.event_date = s.event_date
         WHEN MATCHED AND t.click = 0
         THEN UPDATE SET t.click = 1, t.updated_at = current_timestamp()
     """)
 
-    # Conversion attribution: window 내 매칭 impression에 conversion=1 및 지연 정보 업데이트
+    # --- conversion attribution ---
     conv_updates = (
         cvt.alias("cv")
         .join(
-            silver_for_conv.alias("s"),
+            silver.alias("s"),
+            # 조건 1: eid 일치
             (col("cv.eid") == col("s.event_id"))
-            & (col("cv.timestamp") - col("s.event_time").cast("long")).between(0, conv_window_sec),
+            # 조건 2: attribution window 판정 — conversion은 30일 window
+            & (col("cv.timestamp") - col("s.event_time").cast("long")).between(0, conv_window_sec)
+            # 조건 3: Silver event_date 파티션 pruning 힌트 — click과 동일한 원리, window만 30일
+            & (col("s.event_date") >= to_date((col("cv.timestamp") - conv_window_sec).cast("timestamp"))),
             how="inner",
         )
         .select(
             col("s.event_id"),
+            col("s.event_date"),
             col("cv.timestamp").cast(LongType()).alias("conversion_timestamp"),
             (col("cv.timestamp") - col("s.event_time").cast("long")).cast(LongType()).alias("conversion_delay_sec"),
         )
@@ -385,7 +388,7 @@ def run_attribution_stage(
     spark.sql(f"""
         MERGE INTO {FULL_NAME} t
         USING conv_updates s
-        ON t.event_id = s.event_id
+        ON t.event_id = s.event_id AND t.event_date = s.event_date
         WHEN MATCHED AND t.conversion = 0
         THEN UPDATE SET
             t.conversion           = 1,
@@ -427,7 +430,7 @@ def main():
         clk_df = read_raw(spark, args.s3_raw_base, "click",      args.run_date_start, args.run_date_end)
         cvt_df = read_raw(spark, args.s3_raw_base, "conversion", args.run_date_start, args.run_date_end)
         run_impression_stage(spark, imp_df)
-        run_attribution_stage(spark, clk_df, cvt_df, click_window_sec, conv_window_sec, args.run_date_end)
+        run_attribution_stage(spark, clk_df, cvt_df, click_window_sec, conv_window_sec)
 
     spark.stop() # 리소스 정리 - 배치 작업
 
