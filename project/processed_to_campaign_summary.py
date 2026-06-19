@@ -2,24 +2,26 @@
 processed_events(silver) → campaign_summary Iceberg (gold), 일단위 배치.
 Airflow 자동화: run_date_end를 {{ ds }} 로 주입하면 일배치 스케줄링 됨.
 
-[KPI 최신 유지 전략]
-30일 lookback window로 매일 재집계 후 MERGE INTO 실행.
-silver의 conversion_window(30일)와 동일한 범위를 읽으므로
-window 내 지연 conversion이 반영된 시점에 campaign_summary도 자동 갱신됨.
-30일 초과 과거분은 MERGE 대상 외이므로 전체 재계산 불필요.
+[KPI 최신 유지 전략 — 2가지 모드]
+
+일배치 모드 (--run-date-start 미지정):
+  Silver의 오늘 커밋 변경분을 Iceberg snapshot diff로 감지해 해당 event_date만 재집계.
+  지연 attribution으로 인한 오래된 event_date 파티션 갱신도 lookback 제한 없이 자동 포함.
+  Silver와 Gold가 같은 날 실행된다는 전제 (Airflow DAG 의존성으로 보장).
+
+명시 재처리 모드 (--run-date-start 지정):
+  지정 event_date 범위를 Silver 현재 상태 기준으로 재집계.
+  Gold 로직 버그 수정 후 재집계, 특정 기간 강제 재처리 등에 사용.
+  Silver snapshot 이력과 무관하게 독립 실행 가능.
 
 [처리 지연 모니터링]
 end_to_end_latency_sec 등 지연 컬럼은 campaign KPI 집계 범위 밖.
 별도 monitoring.py에서 processed_events를 읽어 모니터링 테이블을 관리하는 것이 적합 (관심사 분리).
-
-[향후 최적화]
-매일 30일치 전체 재집계 대신, Iceberg snapshot diff로 silver의 변경 파티션만 감지해
-해당 summary_date만 재집계하는 delta 방식으로 전환 가능.
 """
 
 import argparse
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
@@ -37,9 +39,6 @@ SILVER_TABLE = f"{CATALOG}.silver.processed_events"
 
 
 def parse_args():
-    # run_date_end 기본값은 어제 — 일배치이므로 매일 전날치까지를 처리
-    # lookback_days는 silver의 conversion_window_days(30일)와 반드시 일치해야
-    # window 내 지연 conversion이 모두 반영된 집계를 얻을 수 있음
     yesterday = (date.today() - timedelta(days=1)).isoformat()
 
     parser = argparse.ArgumentParser(
@@ -48,13 +47,15 @@ def parse_args():
     parser.add_argument(
         "--run-date-end",
         default=yesterday,
-        help="집계 종료 날짜 (YYYY-MM-DD inclusive, 기본값: 어제). silver event_date 파티션 기준",
+        help="집계 종료 날짜 (YYYY-MM-DD, 기본값: 어제). "
+             "일배치 모드에서는 로깅 참조용. 명시 재처리 모드에서는 event_date 상한.",
     )
     parser.add_argument(
-        "--lookback-days",
-        type=int,
-        default=30,
-        help="집계 lookback 일수 (기본값: 30). silver conversion_window_days와 맞춰야 지연 conversion 누락 없음",
+        "--run-date-start",
+        default=None,
+        help="명시 재처리 시작 날짜 (YYYY-MM-DD). "
+             "지정 시 해당 event_date 범위를 Silver 현재 상태 기준으로 재집계 (명시 재처리 모드). "
+             "미지정 시 snapshot diff 모드로 동작.",
     )
     parser.add_argument(
         "--glue-warehouse",
@@ -65,7 +66,8 @@ def parse_args():
         "--full-refresh",
         action="store_true",
         default=False,
-        help="지정 시 테이블 DROP 후 재적재. lookback window 내 데이터만 재적재되므로 전체 재구축 시 --lookback-days를 넓혀야 함",
+        help="지정 시 테이블 전체를 원자적으로 교체 (createOrReplace). "
+             "--run-date-start / --run-date-end 범위 데이터로 재구축.",
     )
 
     return parser.parse_args()
@@ -144,28 +146,35 @@ def ensure_table(spark: SparkSession) -> None:
         PARTITIONED BY (summary_date)
         TBLPROPERTIES (
             'format-version'               = '2',
-            'write.update.mode'            = 'copy-on-write',
             'write.merge.mode'             = 'copy-on-write',
-            'write.delete.mode'            = 'copy-on-write',
             'write.target-file-size-bytes' = '134217728'
         )
     """)
+    # write.merge.mode COW 유지: Gold MERGE는 (summary_date, campaign) 전체를 매 실행마다 갱신.
+    #   갱신 비율이 거의 100%이므로 MOR delta 파일 크기 ≈ base 파일 → COW가 유리.
+    # write.update.mode / write.delete.mode 미설정: standalone UPDATE/DELETE 없음.
 
 
-def aggregate(spark: SparkSession, run_date_end: str, lookback_days: int):
-    # silver의 conversion_window(30일)와 동일한 lookback으로 읽어야
-    # window 내 지연 conversion이 모두 반영된 집계를 얻을 수 있음
-    start_date = (
-        date.fromisoformat(run_date_end) - timedelta(days=lookback_days - 1)
-    ).isoformat()
+def get_changed_event_dates(spark: SparkSession):
+    # 일배치 모드: 오늘 Silver에 커밋된 변경 event_date 수집 (Iceberg snapshot diff)
+    # Silver와 Gold가 같은 날 실행된다는 전제 — Airflow DAG 의존성으로 보장.
+    # Silver Stage 1/2 커밋, Silver 백필 커밋 모두 오늘 timestamp로 포함.
+    # 변경 감지에 데이터 파일 스캔 불필요 — manifest 메타데이터만 읽음.
+    today = date.today()
+    start_ms = int(datetime(today.year, today.month, today.day, tzinfo=timezone.utc).timestamp() * 1000)
+    end_ms   = start_ms + 86_400_000  # 하루 = 86400초 × 1000ms
 
-    df = (
-        spark.table(SILVER_TABLE)
-        .filter(
-            (col("event_date") >= start_date) & (col("event_date") <= run_date_end)
-        )
+    return (
+        spark.read.format("iceberg")
+        .option("start-timestamp", start_ms)
+        .option("end-timestamp",   end_ms)
+        .load(f"{SILVER_TABLE}.changes")
+        .select("event_date")
+        .distinct()
     )
 
+
+def aggregate(df):
     # 여러 KPI 식에서 재사용하는 집계 표현식 — Catalyst optimizer가 그룹당 한 번만 계산
     impressions_col = count("*")
     clicks_col      = spark_sum("click")
@@ -207,18 +216,18 @@ def aggregate(spark: SparkSession, run_date_end: str, lookback_days: int):
     )
 
 
-def run_full_refresh(spark: SparkSession, staged) -> None:
-    # DROP TABLE + 재생성: lookback window 내 데이터로만 재적재
-    # 전체 이력 재구축 시 --lookback-days를 넓히거나 날짜 범위를 슬라이딩하며 복수 실행
-    spark.sql(f"DROP TABLE IF EXISTS {FULL_NAME}")
-    ensure_table(spark)
-    staged.writeTo(FULL_NAME).append()
+def run_full_refresh(staged) -> None:
+    # createOrReplace(): Iceberg 원자적 테이블 교체
+    #   - Glue catalog 엔트리 유지 (DROP TABLE과 달리 Athena/Superset 참조 유지)
+    #   - 교체 전 스냅샷은 expire 전까지 time travel 가능
+    #   - 실패 시 이전 상태 보존 (원자성 보장)
+    staged.writeTo(FULL_NAME).createOrReplace()
 
 
 def run_merge(spark: SparkSession, staged) -> None:
     staged.createOrReplaceTempView("staged")
     # (summary_date, campaign) 복합키로 upsert
-    # 매 실행마다 30일치 집계를 재계산하므로 MATCHED 시 모든 지표 갱신 (UPDATE SET *)
+    # 변경된 event_date 기준으로 재집계한 결과 → MATCHED 시 모든 지표 갱신
     spark.sql(f"""
         MERGE INTO {FULL_NAME} t
         USING staged s
@@ -234,10 +243,26 @@ def main():
     spark = build_spark(args.glue_warehouse)
     ensure_table(spark)
 
-    staged = aggregate(spark, args.run_date_end, args.lookback_days)
+    if args.run_date_start:
+        # 명시 재처리 모드: event_date 범위를 Silver 현재 상태 기준으로 재집계
+        # Silver snapshot 이력과 무관 → Gold 독립 재처리 가능, MERGE 멱등
+        df = (
+            spark.table(SILVER_TABLE)
+            .filter(
+                (col("event_date") >= args.run_date_start)
+                & (col("event_date") <= args.run_date_end)
+            )
+        )
+    else:
+        # 일배치 모드: 오늘 Silver 커밋 변경 event_date만 재집계 (snapshot diff)
+        # 지연 attribution으로 갱신된 오래된 event_date도 lookback 제한 없이 포함
+        changed_dates = get_changed_event_dates(spark)
+        df = spark.table(SILVER_TABLE).join(changed_dates, on="event_date", how="inner")
+
+    staged = aggregate(df)
 
     if args.full_refresh:
-        run_full_refresh(spark, staged)
+        run_full_refresh(staged)
     else:
         run_merge(spark, staged)
 

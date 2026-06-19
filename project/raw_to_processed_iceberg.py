@@ -270,16 +270,12 @@ def transform(imp_df, clk_df, cvt_df, click_window_sec: int, conv_window_sec: in
     )
 
 
-def run_full_refresh(spark: SparkSession, staged) -> None:
-    # overwritePartitions() 대신 DROP TABLE + append 사용:
-    # raw 파티션 키(raw_date, ingest 기준)와 processed 파티션 키(event_date, 이벤트 발생 기준)가 달라
-    # raw_date=N 하나를 처리해도 결과 event_date는 지연 이벤트로 인해 여러 날짜에 걸침.
-    # overwritePartitions()는 결과 DataFrame에 포함된 event_date 파티션을 통째로 덮어쓰므로
-    # 이전 run에서 정확히 채워둔 다른 날짜 파티션까지 삭제될 수 있음.
-    # full_refresh는 전체 재적재가 목적이므로 테이블 자체를 DROP 후 재생성하는 것이 안전하고 명확함.
-    spark.sql(f"DROP TABLE IF EXISTS {FULL_NAME}")
-    ensure_table(spark)
-    staged.writeTo(FULL_NAME).append()
+def run_full_refresh(staged) -> None:
+    # createOrReplace(): Iceberg 원자적 테이블 교체
+    #   - Glue catalog 엔트리 유지 (DROP TABLE은 Athena/Superset 참조 단절, 스냅샷 이력 소멸 위험)
+    #   - 교체 전 스냅샷은 expire 전까지 time travel 가능
+    #   - 실패 시 이전 상태 보존 (원자성 보장)
+    staged.writeTo(FULL_NAME).createOrReplace()
 
 
 def run_impression_stage(spark: SparkSession, imp_df) -> None:
@@ -355,6 +351,19 @@ def run_attribution_stage(
         # event_date를 함께 전달 → MERGE ON 절에서 파티션 키로 타겟 pruning
         .select(col("s.event_id"), col("s.event_date"))
     )
+    # Soft failure 감지: Bronze에 click이 있는데 Silver impression 매칭이 0건이면
+    # Stage 1 미완료 또는 Silver 데이터 누락 의심 → 조용히 지나가지 않고 명시적으로 실패
+    # Hard failure(MERGE exception)는 Airflow가 잡지만, 0건 업데이트는 정상 종료처럼 보임
+    bronze_click_count = clk.count()
+    matched_click_count = click_updates.count()
+    if bronze_click_count > 0 and matched_click_count == 0:
+        raise RuntimeError(
+            f"Click attribution Stage 2 anomaly: "
+            f"Bronze click {bronze_click_count}건 중 Silver impression 매칭 0건 — "
+            f"Stage 1 실패 또는 impression 누락 의심"
+            f"Attribution window 내 impression 부재"
+        )
+    
     click_updates.createOrReplaceTempView("click_updates")
     spark.sql(f"""
         MERGE INTO {FULL_NAME} t
@@ -384,6 +393,17 @@ def run_attribution_stage(
             (col("cv.timestamp") - col("s.event_time").cast("long")).cast(LongType()).alias("conversion_delay_sec"),
         )
     )
+
+    bronze_conv_count = cvt.count()
+    matched_conv_count = conv_updates.count()
+    if bronze_conv_count > 0 and matched_conv_count == 0:
+        raise RuntimeError(
+            f"Conversion attribution Stage 2 anomaly: "
+            f"Bronze conversion {bronze_conv_count}건 중 Silver impression 매칭 0건 — "
+            f"Stage 1 실패 또는 impression 누락 의심"
+            f"Attribution window 내 impression 부재"
+        )
+    
     conv_updates.createOrReplaceTempView("conv_updates")
     spark.sql(f"""
         MERGE INTO {FULL_NAME} t
@@ -425,7 +445,7 @@ def main():
         clk_df = read_raw(spark, args.s3_raw_base, "click",      args.run_date_start, click_raw_end)
         cvt_df = read_raw(spark, args.s3_raw_base, "conversion", args.run_date_start, conv_raw_end)
         staged = transform(imp_df, clk_df, cvt_df, click_window_sec, conv_window_sec)
-        run_full_refresh(spark, staged)
+        run_full_refresh(staged)
     else:
         clk_df = read_raw(spark, args.s3_raw_base, "click",      args.run_date_start, args.run_date_end)
         cvt_df = read_raw(spark, args.s3_raw_base, "conversion", args.run_date_start, args.run_date_end)
