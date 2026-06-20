@@ -166,12 +166,21 @@ def ensure_table(spark: SparkSession) -> None:
         USING iceberg
         PARTITIONED BY (event_date)
         TBLPROPERTIES (
-            'format-version'                = '2',
-            'write.merge.mode'              = 'merge-on-read',
-            'write.target-file-size-bytes'  = '134217728'
+            'format-version'                         = '2',
+            'write.merge.mode'                       = 'merge-on-read',
+            'write.target-file-size-bytes'           = '134217728',
+            'write.metadata.previous-versions-max'   = '21',
+            'write.metadata.delete-after-commit.enabled' = 'true'
         )
     """)
     # write.merge.mode MOR: MERGE INTO 구문 전체에 적용.
+    # write.metadata.previous-versions-max=21 + delete-after-commit.enabled:
+    #   Silver는 하루 3커밋(impression/click/conversion) → 21 = 7일치 metadata.json 보존.
+    #   Gold는 하루 1커밋 → previous-versions-max=7로 동일 7일 커버 (캘린더 기준 통일).
+    #   expire_snapshots(30일) > metadata.json 보존(7일) → 복구 시 스냅샷 데이터 파일 생존 보장.
+        # metadata.json 보존 기간 ≤ 스냅샷 보존 기간
+        # metadata.json 보존 기간 = previous-versions-max ÷ (하루 커밋 수)
+        # Silver: 21 ÷ 3회/일 = 7일  <  expire 30일  ✓
     #   WHEN NOT MATCHED INSERT → 항상 append, COW/MOR 무관.
     #   WHEN MATCHED UPDATE    → MOR는 delta 파일만 append (COW는 파일 전체 재작성).
     #   광고 데이터 특성상 UPDATE 대상(click/conversion)은 전체 impression의 <2% → MOR 효과 큼.

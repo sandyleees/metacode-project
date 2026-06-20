@@ -145,13 +145,17 @@ def ensure_table(spark: SparkSession) -> None:
         USING iceberg
         PARTITIONED BY (summary_date)
         TBLPROPERTIES (
-            'format-version'               = '2',
-            'write.merge.mode'             = 'copy-on-write',
-            'write.target-file-size-bytes' = '134217728'
+            'format-version'                         = '2',
+            'write.merge.mode'                       = 'copy-on-write',
+            'write.target-file-size-bytes'           = '134217728',
+            'write.metadata.previous-versions-max'   = '7',
+            'write.metadata.delete-after-commit.enabled' = 'true'
         )
     """)
     # write.merge.mode COW 유지: Gold MERGE는 (summary_date, campaign) 전체를 매 실행마다 갱신.
-    #   갱신 비율이 거의 100%이므로 MOR delta 파일 크기 ≈ base 파일 → COW가 유리.
+    # write.metadata.previous-versions-max=7 + delete-after-commit.enabled:
+    #   Gold는 하루 1커밋 → 7 = 7일치 metadata.json 보존 (Silver의 21과 캘린더 기준 통일).
+    #   expire_snapshots(30일) > metadata.json 보존(7일) → 복구 시 스냅샷 데이터 파일 생존 보장.
     # write.update.mode / write.delete.mode 미설정: standalone UPDATE/DELETE 없음.
 
 
