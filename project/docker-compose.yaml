@@ -198,7 +198,7 @@ services:
         --conf spark.cores.max=3
         --conf spark.executor.cores=1
         --conf spark.executor.memory=800m
-        /app/kafka_to_raw.py --topic-type impression
+        /app/jobs/kafka_to_raw.py --topic-type impression
     ports:
       - "4040:4040"   # Spark Driver Web UI: http://localhost:4040
 
@@ -211,7 +211,7 @@ services:
         --conf spark.cores.max=3
         --conf spark.executor.cores=1
         --conf spark.executor.memory=800m
-        /app/kafka_to_raw.py --topic-type click
+        /app/jobs/kafka_to_raw.py --topic-type click
     ports:
       - "4041:4040"   # Spark Driver Web UI: http://localhost:4041
 
@@ -224,7 +224,7 @@ services:
         --conf spark.cores.max=1
         --conf spark.executor.cores=1
         --conf spark.executor.memory=800m
-        /app/kafka_to_raw.py --topic-type conversion
+        /app/jobs/kafka_to_raw.py --topic-type conversion
     ports:
       - "4042:4040"   # Spark Driver Web UI: http://localhost:4042
 
@@ -254,7 +254,7 @@ services:
         --conf spark.cores.max=2
         --conf spark.executor.cores=1
         --conf spark.executor.memory=1g
-        /app/raw_to_processed_iceberg.py
+        /app/jobs/raw_to_processed_iceberg.py
     depends_on:
       spark-master:
         condition: service_healthy
@@ -288,7 +288,7 @@ services:
         --conf spark.cores.max=2
         --conf spark.executor.cores=1
         --conf spark.executor.memory=1g
-        /app/processed_to_campaign_summary.py
+        /app/jobs/processed_to_campaign_summary.py
     depends_on:
       spark-master:
         condition: service_healthy
