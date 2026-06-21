@@ -28,8 +28,8 @@ import os
 from datetime import datetime, timedelta
 
 from airflow import DAG
-from airflow.operators.bash import BashOperator
-from airflow.operators.python import ShortCircuitOperator
+from airflow.providers.standard.operators.bash import BashOperator
+from airflow.providers.standard.operators.python import ShortCircuitOperator
 from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
 
 # ── 환경 설정 ────────────────────────────────────────────────────────────────
@@ -108,7 +108,7 @@ with DAG(
     silver_cmd = (
         f"cd {COMPOSE_DIR} && "
         "docker compose --profile batch run --rm raw-to-processed "
-        f"{SPARK_SUBMIT_BASE} /app/raw_to_processed_iceberg.py "
+        f"{SPARK_SUBMIT_BASE} /app/jobs/raw_to_processed_iceberg.py "
         "--run-date-end {{ ds }}"
         # 백필 시: DAG Conf에 run_date_start 있으면 추가 (ShortCircuit 대신 Jinja 분기)
         "{% if dag_run.conf.get('run_date_start') %}"
@@ -137,7 +137,7 @@ with DAG(
     gold_cmd = (
         f"cd {COMPOSE_DIR} && "
         "docker compose --profile batch run --rm processed-to-summary "
-        f"{SPARK_SUBMIT_BASE} /app/processed_to_campaign_summary.py "
+        f"{SPARK_SUBMIT_BASE} /app/jobs/processed_to_campaign_summary.py "
         "--run-date-end {{ ds }}"
         "{% if dag_run.conf.get('run_date_start') %}"
         " --run-date-start {{ dag_run.conf['run_date_start'] }}"

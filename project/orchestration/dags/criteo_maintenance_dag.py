@@ -17,8 +17,10 @@ import os
 from datetime import datetime, timedelta
 
 from airflow import DAG
-from airflow.operators.bash import BashOperator
-from airflow.sensors.external_task import ExternalTaskSensor
+from airflow.operators.empty import EmptyOperator
+from airflow.providers.standard.operators.bash import BashOperator
+from airflow.providers.standard.sensors.external_task import ExternalTaskSensor
+from airflow.utils.trigger_rule import TriggerRule
 
 COMPOSE_DIR = os.environ.get("COMPOSE_DIR", "/home/sandy/metacode-project/project")
 
@@ -29,7 +31,7 @@ SPARK_SUBMIT_BASE = (
 )
 
 # run_sql.py를 재사용해 Iceberg CALL PROCEDURE 실행
-RUN_SQL = f"{SPARK_SUBMIT_BASE} /app/run_sql.py"
+RUN_SQL = f"{SPARK_SUBMIT_BASE} /app/analytics/run_sql.py"
 
 default_args = {
     "owner": "data-engineering",
@@ -133,6 +135,14 @@ with DAG(
         "older_than => TIMESTAMP '{{ macros.ds_add(ds, -3) }} 00:00:00')",
     )
 
+    # Silver/Gold 두 chain이 모두 완료됐음을 monthly DAG에 알리는 합류 지점.
+    # ExternalTaskSensor가 단일 task_id만 지정 가능하므로 terminal task가 필요하다.
+    # orphan_silver만 보면 Gold chain이 아직 진행 중일 수 있음 (두 chain은 병렬).
+    maintenance_done = EmptyOperator(
+        task_id="maintenance_done",
+        trigger_rule=TriggerRule.ALL_SUCCESS,   # Silver/Gold 양쪽 모두 성공해야 통과
+    )
+
     # ── 의존성 ────────────────────────────────────────────────────────────────
     # Silver: compact(매일) → expire → orphan
     #   MOR delete file이 매일 누적 → Compaction 필수
@@ -141,3 +151,4 @@ with DAG(
     # rewrite_manifests 생략: rewrite_data_files + expire_snapshots이 구 manifest를 정리함
     wait_for_medallion >> compact_silver >> expire_silver >> orphan_silver
     wait_for_medallion >> expire_gold >> orphan_gold
+    [orphan_silver, orphan_gold] >> maintenance_done
