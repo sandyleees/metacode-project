@@ -28,23 +28,31 @@ import os
 from datetime import datetime, timedelta
 
 from airflow import DAG
-from airflow.providers.standard.operators.bash import BashOperator
-from airflow.providers.standard.operators.python import ShortCircuitOperator
 from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
 
 # ── 환경 설정 ────────────────────────────────────────────────────────────────
 
 S3_RAW_BUCKET = os.environ.get("S3_RAW_BUCKET", "metacode-criteo-project")
 
-# docker-compose 프로젝트 루트 (Airflow가 호스트에서 실행되는 경우)
+# Airflow 컨테이너에 마운트된 프로젝트 루트 경로
 # KubernetesPodOperator / ECSOperator 사용 시 이 경로는 컨테이너 마운트 경로로 대체
-COMPOSE_DIR = os.environ.get("COMPOSE_DIR", "/home/sandy/metacode-project/project")
+PROJECT_DIR = "/home/sandy/metacode-project/project"
 
-SPARK_SUBMIT_BASE = (
-    "/opt/spark/bin/spark-submit "
-    "--master spark://spark-master:7077 "
-    "--conf spark.cores.max=2 "
-)
+SPARK_CONF = {"spark.cores.max": "2", "spark.executor.memory": "1g"}
+
+# SparkSubmitOperator는 서브프로세스로 spark-submit을 실행하므로
+# Airflow 컨테이너의 환경변수가 자동 상속되지 않음 — env_vars로 명시 전달 필요
+SPARK_ENV_VARS = {
+    "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID", ""),
+    "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+    "AWS_DEFAULT_REGION": os.environ.get("AWS_DEFAULT_REGION", "ap-northeast-2"),
+    "AWS_REGION": os.environ.get("AWS_DEFAULT_REGION", "ap-northeast-2"),
+    "S3_RAW_BASE": f"s3a://{S3_RAW_BUCKET}/raw",
+    "GLUE_WAREHOUSE": f"s3a://{S3_RAW_BUCKET}/warehouse",
+    "PYSPARK_PYTHON": "python3",
+    "PYSPARK_DRIVER_PYTHON": "python3",
+}
 
 # ── 공통 기본값 ───────────────────────────────────────────────────────────────
 
@@ -71,8 +79,8 @@ with DAG(
     # UTC 02:00 실행: Bronze Streaming이 전날 데이터를 충분히 적재한 시점 이후
     schedule="0 2 * * *",
     start_date=datetime(2026, 6, 1),
-    # catchup=True: 과거 날짜 백필 가능 (max_active_runs=1 과 함께 직렬 실행)
-    catchup=True,
+    # catchup=False: 과거 missed run 자동 실행 안 함. 백필은 DAG Conf run_date_start/end로 수동 지정
+    catchup=False,
     max_active_runs=1,  # Silver/Gold MERGE 동시 실행 방지
     default_args=default_args,
     tags=["criteo", "iceberg", "medallion"],
@@ -105,23 +113,18 @@ with DAG(
     # ── Task 2: Silver 배치 ───────────────────────────────────────────────────
     # --run-date-end {{ ds }}: Airflow execution date = 처리 대상 날짜 (전날)
     # DAG Conf run_date_start 지정 시 명시 재처리 모드 전환
-    silver_cmd = (
-        f"cd {COMPOSE_DIR} && "
-        "docker compose --profile batch run --rm raw-to-processed "
-        f"{SPARK_SUBMIT_BASE} /app/jobs/raw_to_processed_iceberg.py "
-        "--run-date-end {{ ds }}"
-        # 백필 시: DAG Conf에 run_date_start 있으면 추가 (ShortCircuit 대신 Jinja 분기)
-        "{% if dag_run.conf.get('run_date_start') %}"
-        " --run-date-start {{ dag_run.conf['run_date_start'] }}"
-        "{% endif %}"
-    )
-
-    silver_batch = BashOperator(
+    # TODO [Backfill]: run_date_start 백필 지원 — PythonOperator로 application_args 동적 생성 후
+    #   SparkSubmitOperator에 전달하거나, trigger_dag_id로 별도 백필 DAG 분리
+    silver_batch = SparkSubmitOperator(
         task_id="silver_batch",
-        bash_command=silver_cmd,
-        do_xcom_push=False,
+        application=f"{PROJECT_DIR}/jobs/raw_to_processed_iceberg.py",
+        conn_id="spark_default",
+        conf=SPARK_CONF,
+        env_vars=SPARK_ENV_VARS,
+        application_args=["--run-date-start", "{{ ds }}", "--run-date-end", "{{ ds }}"],
+        execution_timeout=timedelta(hours=2),
         # TODO [Alert]: Stage 2 RuntimeError(impression-click 0 매칭) 발생 시
-        # BashOperator exit code != 0 → retries=2 소진 후 Task FAILED.
+        # exit code != 0 → retries=2 소진 후 Task FAILED.
         # on_failure_callback=slack_alert 으로 "Silver attribution 이상 감지" 알람 추가
     )
 
@@ -134,21 +137,14 @@ with DAG(
     #
     # 명시 재처리 모드 (--run-date-start 지정):
     #   Silver 현재 상태 기준으로 지정 범위 재집계 — snapshot diff 불필요.
-    gold_cmd = (
-        f"cd {COMPOSE_DIR} && "
-        "docker compose --profile batch run --rm processed-to-summary "
-        f"{SPARK_SUBMIT_BASE} /app/jobs/processed_to_campaign_summary.py "
-        "--run-date-end {{ ds }}"
-        "{% if dag_run.conf.get('run_date_start') %}"
-        " --run-date-start {{ dag_run.conf['run_date_start'] }}"
-        "{% endif %}"
-    )
-
-    gold_batch = BashOperator(
+    gold_batch = SparkSubmitOperator(
         task_id="gold_batch",
-        bash_command=gold_cmd,
+        application=f"{PROJECT_DIR}/jobs/processed_to_campaign_summary.py",
+        conn_id="spark_default",
+        conf=SPARK_CONF,
+        env_vars=SPARK_ENV_VARS,
+        application_args=["--run-date-start", "{{ ds }}", "--run-date-end", "{{ ds }}"],
         execution_timeout=timedelta(hours=1),
-        do_xcom_push=False,
         # TODO [Alert]: Gold MERGE 실패 시 KPI 대시보드 데이터 미갱신 상태
         # Silver는 성공했으므로 Gold 단독 재처리로 복구 가능
         # on_failure_callback=slack_alert 으로 "Gold KPI 집계 실패" 알람 추가

@@ -208,7 +208,7 @@ services:
     command: >
       /opt/spark/bin/spark-submit
         --master spark://spark-master:7077
-        --conf spark.cores.max=3
+        --conf spark.cores.max=1
         --conf spark.executor.cores=1
         --conf spark.executor.memory=800m
         /app/jobs/kafka_to_raw.py --topic-type click
@@ -297,9 +297,142 @@ services:
     profiles:
       - batch
 
+  # ── Airflow Metadata DB ───────────────────────────────────────────────────
+  airflow-postgres:
+    image: postgres:15
+    container_name: airflow-postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - airflow_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - lakehouse
+
+  # ── Airflow DB 초기화 (최초 1회) ───────────────────────────────────────────
+  # 실행: docker compose --profile airflow-init up --abort-on-container-exit airflow-init
+  airflow-init:
+    &airflow-common
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: airflow-init
+    entrypoint: /bin/bash      # init 전용 — webserver/scheduler는 각자 entrypoint: "" 로 재정의
+    command:
+      - -c
+      - |
+        airflow db migrate
+    environment: &airflow-common-env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # Airflow 3.x LocalExecutor: task subprocess가 Execution API(/execution/)에 연결
+      # 기본값 http://localhost:8080/execution/ → scheduler 컨테이너에 8080 없음 (Connection refused)
+      # webserver(api-server)가 /execution/ endpoint를 제공하므로 컨테이너 이름으로 지정
+      AIRFLOW__API__BASE_URL: "http://airflow-webserver:8080"
+      AIRFLOW__API__SECRET_KEY: criteo-local-dev
+      # Execution API JWT 서명 키 — scheduler(발행)와 webserver(검증)가 동일해야 함
+      AIRFLOW__API_AUTH__JWT_SECRET: "criteo-local-jwt-secret"
+      # SimpleAuthManager 고정 계정 (Airflow 3.x 기본 auth)
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "admin:Admin"
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: "/opt/airflow/logs/simple_auth_manager_passwords.json"
+      # S3KeySensor(aws_conn_id=aws_default) — boto3가 아래 환경변수로 자동 인증
+      AIRFLOW_CONN_AWS_DEFAULT: "aws://?region_name=${AWS_DEFAULT_REGION:-ap-northeast-2}"
+      # SparkSubmitOperator conn_id=spark_default
+      AIRFLOW_CONN_SPARK_DEFAULT: "spark://spark-master:7077"
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-ap-northeast-2}
+      S3_RAW_BUCKET: metacode-criteo-project
+    volumes: &airflow-common-volumes
+      - ./orchestration/dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Docker Desktop on WSL에서 절대 Linux 경로는 Windows 파일시스템으로 잘못 해석됨
+      # 상대 경로 .을 쓰면 docker-compose.yaml 위치 기준 \\wsl.localhost\... 로 올바르게 resolve됨
+      - .:/home/sandy/metacode-project/project
+    user: "airflow"
+    restart: "no"
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+    networks:
+      - lakehouse
+    profiles:
+      - airflow-init
+
+  # ── Airflow Webserver ─────────────────────────────────────────────────────
+  # http://localhost:8081  (8080은 Spark Master UI 점유)
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    entrypoint: ""
+    command: ["airflow", "api-server"]
+    environment:
+      <<: *airflow-common-env
+    volumes: *airflow-common-volumes
+    ports:
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+    profiles: []
+
+  # ── Airflow DAG Processor ────────────────────────────────────────────────
+  # Airflow 3.x: DAG 파싱이 scheduler에서 분리 — 별도 프로세스 필수
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: airflow-dag-processor
+    entrypoint: ""
+    command: ["airflow", "dag-processor"]
+    environment:
+      <<: *airflow-common-env
+    volumes: *airflow-common-volumes
+    restart: unless-stopped
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+    profiles: []
+
+  # ── Airflow Scheduler ─────────────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    entrypoint: ""
+    command: ["airflow", "scheduler"]
+    environment:
+      <<: *airflow-common-env
+    volumes: *airflow-common-volumes
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "SchedulerJob"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    depends_on:
+      airflow-postgres:
+        condition: service_healthy
+    profiles: []
+
 networks:
   lakehouse:
     driver: bridge
 
 volumes:
   hf_cache:
+  airflow_postgres:
+  airflow_logs:

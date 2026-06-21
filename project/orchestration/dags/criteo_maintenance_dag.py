@@ -18,20 +18,28 @@ from datetime import datetime, timedelta
 
 from airflow import DAG
 from airflow.operators.empty import EmptyOperator
-from airflow.providers.standard.operators.bash import BashOperator
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
 from airflow.providers.standard.sensors.external_task import ExternalTaskSensor
 from airflow.utils.trigger_rule import TriggerRule
 
-COMPOSE_DIR = os.environ.get("COMPOSE_DIR", "/home/sandy/metacode-project/project")
+S3_RAW_BUCKET = os.environ.get("S3_RAW_BUCKET", "metacode-criteo-project")
 
-SPARK_SUBMIT_BASE = (
-    "/opt/spark/bin/spark-submit "
-    "--master spark://spark-master:7077 "
-    "--conf spark.cores.max=2 "
-)
+PROJECT_DIR = "/home/sandy/metacode-project/project"
+
+SPARK_CONF = {"spark.cores.max": "2", "spark.executor.memory": "1g"}
+
+SPARK_ENV_VARS = {
+    "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID", ""),
+    "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+    "AWS_DEFAULT_REGION": os.environ.get("AWS_DEFAULT_REGION", "ap-northeast-2"),
+    "AWS_REGION": os.environ.get("AWS_DEFAULT_REGION", "ap-northeast-2"),
+    "GLUE_WAREHOUSE": f"s3a://{S3_RAW_BUCKET}/warehouse",
+    "PYSPARK_PYTHON": "python3",
+    "PYSPARK_DRIVER_PYTHON": "python3",
+}
 
 # run_sql.py를 재사용해 Iceberg CALL PROCEDURE 실행
-RUN_SQL = f"{SPARK_SUBMIT_BASE} /app/analytics/run_sql.py"
+RUN_SQL_APP = f"{PROJECT_DIR}/analytics/run_sql.py"
 
 default_args = {
     "owner": "data-engineering",
@@ -68,14 +76,15 @@ with DAG(
         timeout=7200,                       # 최대 2시간 대기
     )
 
-    def _make_sql_task(task_id: str, sql: str) -> BashOperator:
-        return BashOperator(
+    def _make_sql_task(task_id: str, sql: str) -> SparkSubmitOperator:
+        # application_args 리스트로 전달 — shell 따옴표 충돌 없음
+        return SparkSubmitOperator(
             task_id=task_id,
-            bash_command=(
-                f"cd {COMPOSE_DIR} && "
-                "docker compose --profile batch run --rm raw-to-processed "
-                f'{RUN_SQL} --sql "{sql}"'
-            ),
+            application=RUN_SQL_APP,
+            conn_id="spark_default",
+            conf=SPARK_CONF,
+            env_vars=SPARK_ENV_VARS,
+            application_args=["--sql", sql],
         )
 
     # ── Silver ───────────────────────────────────────────────────────────────

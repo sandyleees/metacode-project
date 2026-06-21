@@ -1,0 +1,46 @@
+FROM apache/airflow:3.1.5-python3.11
+
+USER root
+
+# SparkSubmitOperator용 Java 17 설치
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openjdk-17-jdk-headless wget \
+ && rm -rf /var/lib/apt/lists/*
+
+# Spark 3.5.0 binary 설치 (spark-submit 실행용 — worker와 버전 일치)
+ENV SPARK_VERSION=3.5.0
+ENV SCALA_MAJOR=2.12
+ENV HADOOP_AWS_VERSION=3.3.4
+ENV AWS_SDK_BUNDLE_VERSION=1.12.262
+ENV ICEBERG_VERSION=1.5.2
+ENV SPARK_HOME=/opt/spark
+ENV PATH="${SPARK_HOME}/bin:${PATH}"
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+
+RUN wget -q "https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop3.tgz" \
+ && tar -xzf "spark-${SPARK_VERSION}-bin-hadoop3.tgz" \
+ && mv "spark-${SPARK_VERSION}-bin-hadoop3" "${SPARK_HOME}" \
+ && rm "spark-${SPARK_VERSION}-bin-hadoop3.tgz"
+
+# SparkSubmitOperator는 클라이언트 모드 — driver가 Airflow 컨테이너에서 실행됨
+# Iceberg/AWS JAR을 driver classpath에 포함해야 SparkCatalog 초기화 가능
+# Dockerfile.spark와 동일한 버전 사용 (worker executor는 worker 이미지의 JAR 사용)
+RUN cd ${SPARK_HOME}/jars && \
+    wget -q "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/${HADOOP_AWS_VERSION}/hadoop-aws-${HADOOP_AWS_VERSION}.jar" && \
+    wget -q "https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_BUNDLE_VERSION}/aws-java-sdk-bundle-${AWS_SDK_BUNDLE_VERSION}.jar" && \
+    wget -q "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-spark-runtime-3.5_${SCALA_MAJOR}/${ICEBERG_VERSION}/iceberg-spark-runtime-3.5_${SCALA_MAJOR}-${ICEBERG_VERSION}.jar" && \
+    wget -q "https://repo1.maven.org/maven2/org/apache/iceberg/iceberg-aws-bundle/${ICEBERG_VERSION}/iceberg-aws-bundle-${ICEBERG_VERSION}.jar"
+
+RUN mkdir -p ${SPARK_HOME}/conf && \
+    echo "spark.hadoop.fs.s3a.impl    org.apache.hadoop.fs.s3a.S3AFileSystem" >> ${SPARK_HOME}/conf/spark-defaults.conf && \
+    echo "spark.sql.extensions        org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions" >> ${SPARK_HOME}/conf/spark-defaults.conf
+
+USER airflow
+
+# S3KeySensor: amazon provider
+# ExternalTaskSensor / BashOperator: standard provider (Airflow 3 core 분리)
+# SparkSubmitOperator: apache-spark provider
+RUN pip install --no-cache-dir \
+      apache-airflow-providers-amazon \
+      apache-airflow-providers-standard \
+      apache-airflow-providers-apache-spark

@@ -22,18 +22,26 @@ import os
 from datetime import datetime, timedelta
 
 from airflow import DAG
-from airflow.providers.standard.operators.bash import BashOperator
+from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
 from airflow.providers.standard.sensors.external_task import ExternalTaskSensor
 
-COMPOSE_DIR = os.environ.get("COMPOSE_DIR", "/home/sandy/metacode-project/project")
+S3_RAW_BUCKET = os.environ.get("S3_RAW_BUCKET", "metacode-criteo-project")
 
-SPARK_SUBMIT_BASE = (
-    "/opt/spark/bin/spark-submit "
-    "--master spark://spark-master:7077 "
-    "--conf spark.cores.max=2 "
-)
+PROJECT_DIR = "/home/sandy/metacode-project/project"
 
-RUN_SQL = f"{SPARK_SUBMIT_BASE} /app/analytics/run_sql.py"
+SPARK_CONF = {"spark.cores.max": "2", "spark.executor.memory": "1g"}
+
+SPARK_ENV_VARS = {
+    "AWS_ACCESS_KEY_ID": os.environ.get("AWS_ACCESS_KEY_ID", ""),
+    "AWS_SECRET_ACCESS_KEY": os.environ.get("AWS_SECRET_ACCESS_KEY", ""),
+    "AWS_DEFAULT_REGION": os.environ.get("AWS_DEFAULT_REGION", "ap-northeast-2"),
+    "AWS_REGION": os.environ.get("AWS_DEFAULT_REGION", "ap-northeast-2"),
+    "GLUE_WAREHOUSE": f"s3a://{S3_RAW_BUCKET}/warehouse",
+    "PYSPARK_PYTHON": "python3",
+    "PYSPARK_DRIVER_PYTHON": "python3",
+}
+
+RUN_SQL_APP = f"{PROJECT_DIR}/analytics/run_sql.py"
 
 default_args = {
     "owner": "data-engineering",
@@ -46,7 +54,7 @@ with DAG(
     dag_id="criteo_iceberg_maintenance_monthly",
     description="Iceberg manifest 재편성 — 월간 (매월 1일)",
     schedule="0 2 1 * *",   # 매월 1일 02:00 — daily maintenance와 동일 시각, ExternalTaskSensor가 완료 보장
-    start_date=datetime(2026, 7, 1),
+    start_date=datetime(2026, 6, 1),
     catchup=False,
     max_active_runs=1,
     default_args=default_args,
@@ -54,15 +62,13 @@ with DAG(
 ) as dag:
 
     # ── Task 0: daily maintenance 완료 대기 ──────────────────────────────────
-    # monthly DAG(04:00)는 daily maintenance DAG(02:00)가 끝난 뒤 실행해야 한다.
     # rewrite_manifests는 새 스냅샷을 생성하므로, 진행 중인 MERGE·compaction과
     # 겹치면 Iceberg 낙관적 잠금 충돌이 발생한다.
-    # execution_date_fn: monthly DAG의 실행 시각(04:00)을 daily DAG 실행 시각(02:00)으로 맞춤
+    # 두 DAG 모두 schedule="0 2 1/? * *" 동일 시각이므로 같은 logical_date로 매칭됨
     wait_for_daily_maintenance = ExternalTaskSensor(
         task_id="wait_for_daily_maintenance",
         external_dag_id="criteo_iceberg_maintenance",
         external_task_id="maintenance_done",   # Silver/Gold 두 chain이 모두 완료된 합류 지점
-        execution_date_fn=lambda dt: dt.replace(hour=2, minute=0, second=0, microsecond=0),
         allowed_states=["success"],
         failed_states=["failed", "skipped"],
         mode="reschedule",
@@ -70,14 +76,15 @@ with DAG(
         timeout=7200,
     )
 
-    def _make_sql_task(task_id: str, sql: str) -> BashOperator:
-        return BashOperator(
+    def _make_sql_task(task_id: str, sql: str) -> SparkSubmitOperator:
+        # application_args 리스트로 전달 — shell 따옴표 충돌 없음
+        return SparkSubmitOperator(
             task_id=task_id,
-            bash_command=(
-                f"cd {COMPOSE_DIR} && "
-                "docker compose --profile batch run --rm raw-to-processed "
-                f'{RUN_SQL} --sql "{sql}"'
-            ),
+            application=RUN_SQL_APP,
+            conn_id="spark_default",
+            conf=SPARK_CONF,
+            env_vars=SPARK_ENV_VARS,
+            application_args=["--sql", sql],
         )
 
     # ── Silver manifest 재편성 ────────────────────────────────────────────────
