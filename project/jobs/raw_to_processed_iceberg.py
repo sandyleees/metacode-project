@@ -7,6 +7,7 @@ import argparse
 import logging
 import os
 from datetime import date, timedelta
+from pathlib import Path
 
 from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql.functions import (
@@ -94,38 +95,17 @@ def parse_args() -> argparse.Namespace:
 def ensure_table(spark: SparkSession) -> None:
     """Silver 데이터베이스와 processed_events 테이블이 없으면 생성한다.
 
-    테이블 스키마 설계(sentinel 값, 지연 측정 컬럼)와 TBLPROPERTIES 근거는
-    JOBS_GUIDE.md §2-4, §2-5 참고.
+    스키마 정의는 jobs/ddl/silver_processed_events.sql 참고.
     """
-    spark.sql(f"CREATE DATABASE IF NOT EXISTS {CATALOG}.{DATABASE}")
-    spark.sql(f"""
-        CREATE TABLE IF NOT EXISTS {FULL_NAME} (
-            event_id                STRING    NOT NULL COMMENT 'impression eid — 세 이벤트 타입 간 공통 join 키',
-            event_date              DATE      NOT NULL COMMENT '파티션 키; impression unix ts 기준 일자',
-            event_hour              INT                COMMENT '시계열 분석용; impression 발생 시(0~23)',
-            event_time              TIMESTAMP          COMMENT 'impression 발생 절대시각',
-            uid                     STRING    NOT NULL COMMENT '유저 식별자',
-            campaign                INT                COMMENT '캠페인 식별자',
-            click                   INT                COMMENT '클릭 발생 1, 없으면 0',
-            conversion              INT                COMMENT '전환 발생 1, 없으면 0',
-            conversion_timestamp    BIGINT             COMMENT '전환 unix ts(초); 전환 없으면 -1',
-            conversion_delay_sec    BIGINT             COMMENT 'conversion_ts - impression_ts(초); 전환 없으면 -1',
-            cost                    DOUBLE             COMMENT 'impression 비용 (transformed)',
-            producer_to_broker_sec  BIGINT             COMMENT '브로커 수신 - 이벤트 발생(초); 프로듀서·네트워크 지연',
-            broker_to_ingest_sec    BIGINT             COMMENT 'Spark ingest - 브로커 수신(초); 소비자 처리 지연',
-            end_to_end_latency_sec  BIGINT             COMMENT 'Spark ingest - 이벤트 발생(초); 전체 파이프라인 지연',
-            updated_at              TIMESTAMP          COMMENT 'click/conversion MERGE 반영 시각'
-        )
-        USING iceberg
-        PARTITIONED BY (event_date)
-        TBLPROPERTIES (
-            'format-version'                              = '2',
-            'write.merge.mode'                            = 'merge-on-read',
-            'write.target-file-size-bytes'                = '134217728',
-            'write.metadata.previous-versions-max'        = '21',
-            'write.metadata.delete-after-commit.enabled'  = 'true'
-        )
-    """)
+    ddl_path = Path(__file__).parent / "ddl" / "silver_processed_events.sql"
+    for stmt in _parse_sql(ddl_path.read_text(encoding="utf-8")):
+        spark.sql(stmt)
+
+
+def _parse_sql(text: str) -> list[str]:
+    """SQL 파일을 세미콜론 기준으로 분리하고 -- 주석 줄을 제거한다."""
+    lines = [ln for ln in text.splitlines() if not ln.strip().startswith("--")]
+    return [s.strip() for s in "\n".join(lines).split(";") if s.strip()]
 
 
 def read_raw(

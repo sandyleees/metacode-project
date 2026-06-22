@@ -8,6 +8,7 @@ import argparse
 import logging
 import os
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import (
@@ -79,45 +80,17 @@ def parse_args() -> argparse.Namespace:
 def ensure_table(spark: SparkSession) -> None:
     """Gold 데이터베이스와 campaign_summary 테이블이 없으면 생성한다.
 
-    TBLPROPERTIES 설계 배경(COW 선택, metadata 보존 정책)은 JOBS_GUIDE.md §3-3 참고.
+    스키마 정의는 jobs/ddl/gold_campaign_summary.sql 참고.
     """
-    spark.sql(f"CREATE DATABASE IF NOT EXISTS {CATALOG}.{DATABASE}")
-    spark.sql(f"""
-        CREATE TABLE IF NOT EXISTS {FULL_NAME} (
-            summary_date                DATE      NOT NULL COMMENT 'event_date 기준 집계 날짜; 파티션 키',
-            campaign                    INT       NOT NULL COMMENT '캠페인 식별자',
+    ddl_path = Path(__file__).parent / "ddl" / "gold_campaign_summary.sql"
+    for stmt in _parse_sql(ddl_path.read_text(encoding="utf-8")):
+        spark.sql(stmt)
 
-            impressions                 BIGINT             COMMENT 'COUNT(*)',
-            clicks                      BIGINT             COMMENT 'SUM(click)',
-            conversions                 BIGINT             COMMENT 'SUM(conversion)',
-            unique_users                BIGINT             COMMENT 'COUNT(DISTINCT uid)',
-            converting_users            BIGINT             COMMENT 'COUNT(DISTINCT uid WHERE conversion=1)',
-            total_cost                  DOUBLE             COMMENT 'SUM(cost)',
 
-            ctr                         DOUBLE             COMMENT 'clicks / impressions × 100',
-            cvr                         DOUBLE             COMMENT 'conversions / clicks × 100; clicks=0이면 NULL',
-            cpc                         DOUBLE             COMMENT 'total_cost / clicks; clicks=0이면 NULL',
-            cpa                         DOUBLE             COMMENT 'total_cost / conversions; conversions=0이면 NULL',
-            cpm                         DOUBLE             COMMENT 'total_cost / impressions × 1000',
-
-            click_through_conversions   BIGINT             COMMENT 'COUNT(click=1 AND conversion=1)',
-            view_through_conversions    BIGINT             COMMENT 'COUNT(click=0 AND conversion=1)',
-            avg_conversion_delay_sec    DOUBLE             COMMENT 'AVG(conversion_delay_sec >= 0); -1 sentinel 제외',
-
-            frequency                   DOUBLE             COMMENT 'impressions / unique_users',
-
-            updated_at                  TIMESTAMP          COMMENT 'MERGE 실행 시각'
-        )
-        USING iceberg
-        PARTITIONED BY (summary_date)
-        TBLPROPERTIES (
-            'format-version'                              = '2',
-            'write.merge.mode'                            = 'copy-on-write',
-            'write.target-file-size-bytes'                = '134217728',
-            'write.metadata.previous-versions-max'        = '7',
-            'write.metadata.delete-after-commit.enabled'  = 'true'
-        )
-    """)
+def _parse_sql(text: str) -> list[str]:
+    """SQL 파일을 세미콜론 기준으로 분리하고 -- 주석 줄을 제거한다."""
+    lines = [ln for ln in text.splitlines() if not ln.strip().startswith("--")]
+    return [s.strip() for s in "\n".join(lines).split(";") if s.strip()]
 
 
 def get_changed_event_dates(spark: SparkSession) -> DataFrame:
