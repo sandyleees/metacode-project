@@ -1,4 +1,4 @@
-"""Spark + Iceberg + Glue Catalog 공통 세션 빌더.
+"""Spark + Iceberg + Glue Catalog 공통 유틸리티.
 
 Driver/Executor 자격증명 분리 구조와 S3FileIO vs Hadoop S3A 차이는
 JOBS_GUIDE.md §4 참고.
@@ -10,6 +10,19 @@ import os
 from pyspark.sql import SparkSession
 
 logger = logging.getLogger(__name__)
+
+
+def parse_sql(text: str) -> list[str]:
+    """SQL 파일 텍스트를 세미콜론 기준으로 분리하고 -- 주석 줄을 제거한다.
+
+    Args:
+        text: SQL 파일 전체 텍스트
+
+    Returns:
+        빈 문자열을 제외한 SQL 문 리스트
+    """
+    lines = [ln for ln in text.splitlines() if not ln.strip().startswith("--")]
+    return [s.strip() for s in "\n".join(lines).split(";") if s.strip()]
 
 
 def build_spark(app_name: str, catalog: str, glue_warehouse: str) -> SparkSession:

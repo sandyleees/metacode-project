@@ -43,6 +43,8 @@ Gold는 Silver를 campaign + date 기준으로 집계한 KPI 테이블이다.
 
 ## 2. raw_to_processed_iceberg.py — Silver 배치
 
+> 스키마 정의: `jobs/ddl/silver_processed_events.sql`
+
 ### 2-1. 왜 2-Stage인가 (`run_impression_stage` / `run_attribution_stage`)
 
 **문제:** click은 impression 발생 후 며칠 뒤에 수집된다.
@@ -210,6 +212,8 @@ MERGE SQL이 실행될 때도 `clk` (click_updates의 원본)가 재사용되기
 ---
 
 ## 3. processed_to_campaign_summary.py — Gold 배치
+
+> 스키마 정의: `jobs/ddl/gold_campaign_summary.sql`
 
 ### 3-1. 두 가지 실행 모드
 

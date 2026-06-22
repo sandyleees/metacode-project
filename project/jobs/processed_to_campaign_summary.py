@@ -16,7 +16,7 @@ from pyspark.sql.functions import (
     sum as spark_sum, when,
 )
 
-from spark_utils import build_spark
+from spark_utils import build_spark, parse_sql
 
 logger = logging.getLogger(__name__)
 
@@ -83,14 +83,8 @@ def ensure_table(spark: SparkSession) -> None:
     스키마 정의는 jobs/ddl/gold_campaign_summary.sql 참고.
     """
     ddl_path = Path(__file__).parent / "ddl" / "gold_campaign_summary.sql"
-    for stmt in _parse_sql(ddl_path.read_text(encoding="utf-8")):
+    for stmt in parse_sql(ddl_path.read_text(encoding="utf-8")):
         spark.sql(stmt)
-
-
-def _parse_sql(text: str) -> list[str]:
-    """SQL 파일을 세미콜론 기준으로 분리하고 -- 주석 줄을 제거한다."""
-    lines = [ln for ln in text.splitlines() if not ln.strip().startswith("--")]
-    return [s.strip() for s in "\n".join(lines).split(";") if s.strip()]
 
 
 def get_changed_event_dates(spark: SparkSession) -> DataFrame:
