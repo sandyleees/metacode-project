@@ -6,6 +6,7 @@ import os
 S3_RAW_BUCKET: str = os.environ.get("S3_RAW_BUCKET", "metacode-criteo-project")
 PROJECT_DIR: str = "/home/sandy/metacode-project/project"
 SPARK_CONF: dict[str, str] = {"spark.cores.max": "2", "spark.executor.memory": "1g"}
+ATHENA_RESULTS_S3: str = f"s3://{S3_RAW_BUCKET}/athena-results/"
 
 
 def spark_env_vars(*, include_raw_base: bool = False) -> dict[str, str]:

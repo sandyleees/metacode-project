@@ -26,6 +26,7 @@ from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
 from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
 
 from dag_config import PROJECT_DIR, S3_RAW_BUCKET, SPARK_CONF, spark_env_vars
+from dag_utils import make_athena_gate_task
 
 _ENV_VARS = spark_env_vars(include_raw_base=True)
 
@@ -90,4 +91,70 @@ with DAG(
         execution_timeout=timedelta(hours=1),
     )
 
-    check_bronze_impressions >> silver_batch >> gold_batch
+    # ── Silver 검증 ─────────────────────────────────────────────────────────
+    # silver_batch가 성공했어도 Iceberg 커밋이 없는 조용한 실패를 잡아냄
+    verify_silver_snapshot = make_athena_gate_task(
+        "verify_silver_snapshot",
+        """\
+SELECT 'silver_snapshot_missing' AS alert
+FROM silver."processed_events$snapshots"
+HAVING MAX(committed_at) < current_date""",
+    )
+
+    # {{ ds }} 파티션에 데이터가 0건이면 Gold로 진입 차단
+    verify_silver_rows = make_athena_gate_task(
+        "verify_silver_rows",
+        """\
+SELECT COUNT(*) AS silver_rows
+FROM silver.processed_events
+WHERE event_date = DATE '{ds}'
+HAVING COUNT(*) = 0""",
+    )
+
+    # ── Gold 검증 ────────────────────────────────────────────────────────────
+    verify_gold_snapshot = make_athena_gate_task(
+        "verify_gold_snapshot",
+        """\
+SELECT 'gold_snapshot_missing' AS alert
+FROM gold."campaign_summary$snapshots"
+HAVING MAX(committed_at) < current_date""",
+        database="gold",
+    )
+
+    # Silver COUNT(*) vs Gold SUM(impressions) 차이가 10% 초과하거나
+    # Gold 파티션 자체가 없으면 집계 이상 — CROSS JOIN 후 NULL 조건 명시
+    verify_silver_gold_consistency = make_athena_gate_task(
+        "verify_silver_gold_consistency",
+        """\
+SELECT
+    s.silver_rows,
+    COALESCE(g.gold_impressions, 0)  AS gold_impressions,
+    CASE
+        WHEN g.gold_impressions IS NULL THEN 100.0
+        ELSE ROUND(
+            ABS(CAST(s.silver_rows - g.gold_impressions AS DOUBLE))
+            / NULLIF(s.silver_rows, 0) * 100,
+            2
+        )
+    END                              AS diff_pct
+FROM (
+    SELECT COUNT(*) AS silver_rows
+    FROM silver.processed_events
+    WHERE event_date = DATE '{ds}'
+) s
+CROSS JOIN (
+    SELECT SUM(impressions) AS gold_impressions
+    FROM gold.campaign_summary
+    WHERE summary_date = DATE '{ds}'
+) g
+WHERE g.gold_impressions IS NULL
+   OR ABS(CAST(s.silver_rows - g.gold_impressions AS DOUBLE))
+      / NULLIF(s.silver_rows, 0) > 0.1""",
+    )
+
+    # ── 의존 관계 ────────────────────────────────────────────────────────────
+    # Bronze → Silver → [snapshot 확인, 행수 확인] → Gold → [snapshot 확인, 일관성 확인]
+    check_bronze_impressions >> silver_batch
+    silver_batch >> [verify_silver_snapshot, verify_silver_rows]
+    [verify_silver_snapshot, verify_silver_rows] >> gold_batch
+    gold_batch >> [verify_gold_snapshot, verify_silver_gold_consistency]
