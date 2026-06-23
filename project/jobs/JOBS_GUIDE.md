@@ -9,10 +9,24 @@
 
 1. [아키텍처 개요](#1-아키텍처-개요)
 2. [raw_to_processed_iceberg.py — Silver 배치](#2-raw_to_processed_icebergpy--silver-배치)
+   - 2-1. 왜 2-Stage인가
+   - 2-2. Attribution Window
+   - 2-3. full_refresh 시 raw_date 범위 확장
+   - 2-4. Silver 지연 측정 컬럼
+   - 2-5. createOrReplace() 원자성
+   - 2-6. Iceberg MOR 선택 이유
+   - 2-7. TBLPROPERTIES 설계 근거
+   - 2-8. Soft failure 감지
 3. [processed_to_campaign_summary.py — Gold 배치](#3-processed_to_campaign_summarypy--gold-배치)
+   - 3-1. 두 가지 실행 모드
+   - 3-2. Snapshot diff 방식 이유
+   - 3-3. Iceberg COW 선택 이유
+   - 3-4. KPI 계산식과 분모 0 처리
+   - 3-5. createOrReplace() 원자성
 4. [spark_utils.py — Glue + S3FileIO 자격증명 구조](#4-spark_utilspy--glue--s3fileio-자격증명-구조)
 5. [운영 함정 — 처음에 놓치기 쉬운 것들](#5-운영-함정--처음에-놓치기-쉬운-것들)
 6. [kafka_to_raw.py — Bronze Streaming 적재](#6-kafka_to_rawpy--bronze-streaming-적재)
+   - 6-9. Bronze 추가 컬럼과 보존 정책
 
 ---
 
@@ -134,7 +148,36 @@ conv_raw_end  = run_date_end + timedelta(days=conversion_window_days)  # 30일 �
 
 ---
 
-### 2-4. Iceberg MOR 선택 이유
+### 2-4. Silver 지연 측정 컬럼
+
+Silver는 세 단계의 지연을 각 행에 기록한다.
+
+| 컬럼 | 측정 구간 | 의미 |
+|---|---|---|
+| `producer_to_broker_sec` | `kafka_timestamp - event_time` | 프로듀서 발행 → Kafka 브로커 수신 지연 |
+| `broker_to_ingest_sec` | `ingest_ts - kafka_timestamp` | Kafka 브로커 수신 → Spark ingest 지연 |
+| `end_to_end_latency_sec` | `ingest_ts - event_time` | 이벤트 발생 → Spark ingest 전체 지연 |
+
+세 값을 분리해 기록하는 이유: `end_to_end`가 높아졌을 때 어느 단계(네트워크 vs 소비자 처리)가 원인인지 즉시 구분하기 위해서다.  
+`health-queries/ops/04_pipeline_latency_trend.sql`이 이 세 컬럼의 p50 추이를 시각화한다.
+
+---
+
+### 2-5. `createOrReplace()` — full_refresh 원자성
+
+full_refresh는 `transform()`으로 Silver 전체를 재계산한 후 `createOrReplace()`로 기존 테이블을 교체한다.
+
+```python
+df.writeTo(FULL_NAME).tableProperty(...).createOrReplace()
+```
+
+`createOrReplace()`는 내부적으로 새 파일을 먼저 쓴 다음 메타데이터를 원자적으로 교체한다.  
+`DROP TABLE` + `CREATE TABLE` + 재적재 방식과 달리, 교체 완료 전까지 기존 테이블이 유효하므로  
+Athena 쿼리가 중간에 빈 테이블을 보는 순간이 없다.
+
+---
+
+### 2-6. Iceberg MOR 선택 이유
 
 Silver에는 두 종류의 쓰기가 발생한다:
 
@@ -153,7 +196,7 @@ daily compaction(`compact_silver`)이 흡수한다.
 
 ---
 
-### 2-5. TBLPROPERTIES 설계 근거
+### 2-7. TBLPROPERTIES 설계 근거
 
 **`write.metadata.previous-versions-max = 21`**
 
@@ -179,7 +222,7 @@ Parquet 파일 1개당 128MB를 목표로 한다.
 
 ---
 
-### 2-6. Soft failure 감지 (`_assert_attribution_matched`)
+### 2-8. Soft failure 감지 (`_assert_attribution_matched`)
 
 Stage 2에서 Bronze에 click이 있는데 Silver impression 매칭이 0건이면 조용히 성공처럼 보인다.  
 Airflow는 MERGE가 0건 업데이트를 해도 오류로 인식하지 않는다.
@@ -317,6 +360,11 @@ avg(when(col("conversion_delay_sec") >= 0, col("conversion_delay_sec")))
 `conversion_delay_sec = -1`은 전환이 없음을 나타내는 sentinel 값이다.  
 -1을 포함해서 평균을 내면 실제 전환 지연보다 낮게 집계된다.  
 `>= 0` 조건으로 sentinel을 null로 바꾸면 `avg`가 자동으로 null을 제외한다.
+
+### 3-5. `createOrReplace()` — full_refresh 원자성
+
+Silver §2-5와 동일한 이유로, Gold full_refresh도 `createOrReplace()`를 사용한다.  
+기존 테이블을 내려받는 동안 Athena/Superset 쿼리가 빈 테이블을 보는 순간이 없다.
 
 ---
 
@@ -572,7 +620,28 @@ kafka-to-raw-conversion:  --topic-type conversion  (spark.cores.max=1)
 
 ---
 
-### 6-9. 왜 `spark_utils.build_spark()`를 쓰지 않는가
+### 6-9. Bronze 추가 컬럼과 보존 정책
+
+**추가 컬럼**
+
+Kafka에서 읽은 원본 메시지 외에 네 개의 컬럼을 추가로 기록한다.
+
+| 컬럼 | 출처 | 용도 |
+|---|---|---|
+| `kafka_partition` | Kafka 메타데이터 | dedup 디버깅, 파티션 편향 진단 |
+| `kafka_offset` | Kafka 메타데이터 | dedup 정렬 2차 키 후보 (JOBS_GUIDE §5-E2 참고) |
+| `kafka_timestamp` | Kafka 메타데이터 | 브로커 수신 시각 — Silver 지연 측정 기준 |
+| `ingest_ts` | `spark.sql.functions.current_timestamp()` | Spark ingest 시각 — Bronze `raw_date` 파티션 기준 |
+
+**보존 정책: 무기한**
+
+Bronze는 Silver dedup·attribution 이전의 원본 데이터다.  
+Silver 배치 버그 발견 시 Bronze에서 재처리할 수 있어야 하므로 삭제하지 않는다.  
+Iceberg가 아닌 append-only Parquet이기 때문에 time travel이 없다 — 원본 파일 자체가 유일한 복구 수단이다.
+
+---
+
+### 6-10. 왜 `spark_utils.build_spark()`를 쓰지 않는가
 
 batch 잡은 Iceberg 테이블 읽기/쓰기를 위해 Iceberg SQL extensions + Glue Catalog 설정이 필요하다.  
 `kafka_to_raw.py`는 Parquet을 S3에 직접 쓰므로 Iceberg/Glue 설정이 전혀 필요 없다.
