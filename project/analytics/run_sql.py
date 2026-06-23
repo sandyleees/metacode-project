@@ -19,6 +19,7 @@ rewrite_data_files, expire_snapshots 등)를 운영 배치 스크립트 재빌�
 import argparse
 import logging
 import os
+from typing import List
 
 from pyspark.sql import SparkSession
 
@@ -89,7 +90,7 @@ def build_spark(glue_warehouse: str) -> SparkSession:
     )
 
 
-def split_statements(text: str) -> list[str]:
+def split_statements(text: str) -> List[str]:
     # 문자열 리터럴 내부 세미콜론은 분리 안 함 — ad-hoc 용도 한정
     lines = [ln for ln in text.splitlines() if not ln.strip().startswith("--")]
     return [s.strip() for s in "\n".join(lines).split(";") if s.strip()]

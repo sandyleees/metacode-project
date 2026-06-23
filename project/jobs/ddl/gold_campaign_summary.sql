@@ -5,7 +5,7 @@
 CREATE DATABASE IF NOT EXISTS glue_catalog.gold;
 
 CREATE TABLE IF NOT EXISTS glue_catalog.gold.campaign_summary (
-    summary_date                DATE      NOT NULL COMMENT 'event_date 기준 집계 날짜; 파티션 키',
+    summary_date                DATE      NOT NULL COMMENT 'event_date 기준 집계 날짜, 파티션 키',
     campaign                    INT       NOT NULL COMMENT '캠페인 식별자',
 
     impressions                 BIGINT             COMMENT 'COUNT(*)',
@@ -16,14 +16,14 @@ CREATE TABLE IF NOT EXISTS glue_catalog.gold.campaign_summary (
     total_cost                  DOUBLE             COMMENT 'SUM(cost)',
 
     ctr                         DOUBLE             COMMENT 'clicks / impressions × 100',
-    cvr                         DOUBLE             COMMENT 'conversions / clicks × 100; clicks=0이면 NULL',
-    cpc                         DOUBLE             COMMENT 'total_cost / clicks; clicks=0이면 NULL',
-    cpa                         DOUBLE             COMMENT 'total_cost / conversions; conversions=0이면 NULL',
+    cvr                         DOUBLE             COMMENT 'conversions / clicks × 100 (clicks=0이면 NULL)',
+    cpc                         DOUBLE             COMMENT 'total_cost / clicks (clicks=0이면 NULL)',
+    cpa                         DOUBLE             COMMENT 'total_cost / conversions (conversions=0이면 NULL)',
     cpm                         DOUBLE             COMMENT 'total_cost / impressions × 1000',
 
     click_through_conversions   BIGINT             COMMENT 'COUNT(click=1 AND conversion=1)',
     view_through_conversions    BIGINT             COMMENT 'COUNT(click=0 AND conversion=1)',
-    avg_conversion_delay_sec    DOUBLE             COMMENT 'AVG(conversion_delay_sec >= 0); -1 sentinel 제외',
+    avg_conversion_delay_sec    DOUBLE             COMMENT 'AVG(conversion_delay_sec >= 0), -1 sentinel 제외',
 
     frequency                   DOUBLE             COMMENT 'impressions / unique_users',
 

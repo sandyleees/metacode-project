@@ -6,13 +6,14 @@ JOBS_GUIDE.md §4 참고.
 
 import logging
 import os
+from typing import List
 
 from pyspark.sql import SparkSession
 
 logger = logging.getLogger(__name__)
 
 
-def parse_sql(text: str) -> list[str]:
+def parse_sql(text: str) -> List[str]:
     """SQL 파일 텍스트를 세미콜론 기준으로 분리하고 -- 주석 줄을 제거한다.
 
     Args:
