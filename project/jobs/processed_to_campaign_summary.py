@@ -88,9 +88,13 @@ def ensure_table(spark: SparkSession) -> None:
 
 
 def get_changed_event_dates(spark: SparkSession) -> DataFrame:
-    """오늘 Silver에 커밋된 변경 event_date 목록을 Iceberg snapshot diff로 조회한다.
+    """오늘 Silver에 커밋된 변경 event_date 목록을 before/after snapshot 비교로 조회한다.
 
-    snapshot diff 방식 설계 배경과 UTC 타임존 주의사항은 JOBS_GUIDE.md §3-1, §5-E5 참고.
+    .changes(changelog scan) 대신 snapshot 비교를 사용하는 이유:
+    Silver가 MOR 테이블이므로 delete file이 존재하며, Iceberg changelog scan은
+    delete file을 지원하지 않아 UnsupportedOperationException이 발생한다.
+    오늘 첫 번째 snapshot의 parent(batch 이전 상태)와 현재 상태를 event_date별
+    행 수로 비교해 변경된 파티션을 식별한다.
 
     Args:
         spark: SparkSession
@@ -98,19 +102,45 @@ def get_changed_event_dates(spark: SparkSession) -> DataFrame:
     Returns:
         오늘 변경된 event_date 값들의 DataFrame (컬럼: event_date)
     """
-    today = date.today()
-    start_ms = int(
-        datetime(today.year, today.month, today.day, tzinfo=timezone.utc).timestamp() * 1000
+    today_utc = datetime.now(timezone.utc).date().isoformat()
+
+    first_today = spark.sql(f"""
+        SELECT snapshot_id, parent_id
+        FROM {SILVER_TABLE}.snapshots
+        WHERE committed_at >= TIMESTAMP '{today_utc} 00:00:00'
+        ORDER BY committed_at ASC
+        LIMIT 1
+    """).first()
+
+    if first_today is None:
+        logger.warning("오늘 커밋된 Silver snapshot 없음 — 빈 event_date 반환")
+        return spark.createDataFrame([], schema="event_date date")
+
+    before_id = first_today["parent_id"]
+
+    if before_id is None:
+        # 최초 snapshot — Silver 전체가 새 데이터
+        return spark.table(SILVER_TABLE).select("event_date").distinct()
+
+    curr_counts = spark.table(SILVER_TABLE).groupBy("event_date").count()
+
+    prev_counts = (
+        spark.read.format("iceberg")
+        .option("snapshot-id", str(before_id))
+        .load(SILVER_TABLE)
+        .groupBy("event_date")
+        .count()
+        .withColumnRenamed("count", "prev_count")
     )
-    end_ms = start_ms + 86_400_000
 
     return (
-        spark.read.format("iceberg")
-        .option("start-timestamp", start_ms)
-        .option("end-timestamp", end_ms)
-        .load(f"{SILVER_TABLE}.changes")
+        curr_counts
+        .join(prev_counts, on="event_date", how="left")
+        .filter(
+            col("prev_count").isNull()
+            | (col("count") != col("prev_count"))
+        )
         .select("event_date")
-        .distinct()
     )
 
 

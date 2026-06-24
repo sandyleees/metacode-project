@@ -289,18 +289,42 @@ docker compose --profile batch run --rm processed-to-summary \
 Silver에 6개월치 데이터가 쌓여 있다고 가정하면,  
 오늘 변경된 event_date는 1~2개뿐인데 전체를 읽으면 과도한 S3 스캔이 발생한다.
 
-Iceberg의 `{table}.changes`는 snapshot 단위 변경분을 manifest 메타데이터만 읽어 반환한다.  
-실제 데이터 파일 스캔 없이 "오늘 어떤 event_date 파티션이 변경됐는가"를 알 수 있다.
+**왜 before/after snapshot 행 수 비교인가?**
+
+직관적으로는 Iceberg changelog scan(`.changes`)이 가장 적합해 보이지만, 두 가지 이유로 사용 불가다:
+
+- **`.changes` — MOR delete file 미지원**: Silver는 MOR(Merge-On-Read) 테이블이므로 MERGE 시 delete file이 생성된다. `.changes` changelog scan은 delete file이 포함된 테이블에서 `UnsupportedOperationException`을 던진다.
+- **`$snapshots.sequence_number` 없음**: 이 Iceberg/Spark 버전의 `$snapshots` 메타테이블 실제 컬럼은 `committed_at, snapshot_id, parent_id, operation, manifest_list, summary` 뿐이다. `sequence_number`는 존재하지 않는다 → `AnalysisException`.
+
+**실제 구현: parent_id 기반 before/after 비교**
+
+오늘 첫 번째로 커밋된 snapshot의 `parent_id`가 batch 이전 Silver 상태를 가리킨다.  
+현재 snapshot과 before snapshot의 event_date별 행 수를 비교해 변경 파티션을 감지한다.
 
 ```python
-spark.read.format("iceberg")
-    .option("start-timestamp", start_ms)
-    .option("end-timestamp", end_ms)
-    .load(f"{SILVER_TABLE}.changes")
+# 오늘 첫 snapshot의 parent = batch 이전 상태
+first_today = spark.sql(f"""
+    SELECT snapshot_id, parent_id
+    FROM {SILVER_TABLE}.snapshots
+    WHERE committed_at >= TIMESTAMP '{today_utc} 00:00:00'
+    ORDER BY committed_at ASC LIMIT 1
+""").first()
+
+# 현재 vs before snapshot 행 수 비교
+curr_counts = spark.table(SILVER_TABLE).groupBy("event_date").count()
+prev_counts = (
+    spark.read.format("iceberg")
+    .option("snapshot-id", str(before_id))
+    .load(SILVER_TABLE)
+    .groupBy("event_date").count()
+    .withColumnRenamed("count", "prev_count")
+)
+# prev_count가 없거나 달라진 event_date = 오늘 변경된 파티션
 ```
 
-`start_ms`와 `end_ms`는 UTC 자정 기준 밀리초다.  
-UTC/KST 불일치 주의사항은 §5-E5 참고.
+이 방식은 INSERT(새 event_date 추가)와 행 수 변동이 있는 UPDATE를 모두 감지한다.  
+지연 attribution(지난달 impression에 오늘 click이 매칭)으로 오래된 파티션이 변경된 경우도  
+Silver snapshots만 스캔하면 되므로 전체 데이터 읽기보다 훨씬 가볍다.
 
 ---
 
