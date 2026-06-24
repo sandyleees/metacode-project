@@ -71,7 +71,7 @@ with DAG(
         "expire_silver_snapshots",
         "CALL glue_catalog.system.expire_snapshots("
         "table => 'silver.processed_events', "
-        "older_than => TIMESTAMP '{{ macros.ds_add(ds, -30) }} 00:00:00')",
+        "older_than => TIMESTAMP '{{ macros.ds_add(ds, -31) }} 00:00:00')",
         _ENV_VARS,
     )
 
@@ -80,7 +80,7 @@ with DAG(
         "remove_silver_orphans",
         "CALL glue_catalog.system.remove_orphan_files("
         "table => 'silver.processed_events', "
-        "older_than => TIMESTAMP '{{ macros.ds_add(ds, -3) }} 00:00:00')",
+        "older_than => TIMESTAMP '{{ macros.ds_add(ds, -4) }} 00:00:00')",
         _ENV_VARS,
     )
 
@@ -89,7 +89,7 @@ with DAG(
         "expire_gold_snapshots",
         "CALL glue_catalog.system.expire_snapshots("
         "table => 'gold.campaign_summary', "
-        "older_than => TIMESTAMP '{{ macros.ds_add(ds, -30) }} 00:00:00')",
+        "older_than => TIMESTAMP '{{ macros.ds_add(ds, -31) }} 00:00:00')",
         _ENV_VARS,
     )
 
@@ -98,7 +98,7 @@ with DAG(
         "remove_gold_orphans",
         "CALL glue_catalog.system.remove_orphan_files("
         "table => 'gold.campaign_summary', "
-        "older_than => TIMESTAMP '{{ macros.ds_add(ds, -3) }} 00:00:00')",
+        "older_than => TIMESTAMP '{{ macros.ds_add(ds, -4) }} 00:00:00')",
         _ENV_VARS,
     )
 

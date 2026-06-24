@@ -7,9 +7,10 @@ Bronze(kafka_to_raw.py)는 Spark Structured Streaming — 장시간 실행 서�
 Airflow가 직접 트리거하지 않고 docker-compose restart:on-failure 로 별도 관리.
 이 DAG는 Bronze 파티션 존재를 확인한 뒤 Silver → Gold 순서를 보장한다.
 
-스케줄 타이밍:
-  UTC 02:00 실행 → {{ ds }} = 전날 날짜
-  예) 2026-06-19 02:00 실행 → {{ ds }} = 2026-06-18 → Bronze raw_date=2026-06-18 처리
+스케줄 타이밍 (Airflow 3.x):
+  UTC 02:00 실행 → {{ macros.ds_add(ds, -1) }} = 전날 날짜 = 처리 대상 Bronze 파티션
+  예) 2026-06-24 02:00 실행 → ds=2026-06-24, ds-1=2026-06-23 → raw_date=2026-06-23 처리
+  ※ Airflow 3.x에서 {{ ds }} = logical_date.date() = 트리거 당일이므로 ds-1을 데이터 날짜로 사용
 
 멱등성:
   Silver MERGE ON (event_id, event_date) — 동일 날짜 재실행 안전
@@ -62,7 +63,7 @@ with DAG(
     check_bronze_impressions = S3KeySensor(
         task_id="check_bronze_impressions",
         bucket_name=S3_RAW_BUCKET,
-        bucket_key="raw/impressions/raw_date={{ ds }}/raw_hour=*/part-*.parquet",
+        bucket_key="raw/impressions/raw_date={{ macros.ds_add(ds, -1) }}/raw_hour=*/part-*.parquet",
         wildcard_match=True,
         aws_conn_id="aws_default",
         poke_interval=300,
@@ -77,7 +78,7 @@ with DAG(
         conn_id="spark_default",
         conf=SPARK_CONF,
         env_vars=_ENV_VARS,
-        application_args=["--run-date-start", "{{ ds }}", "--run-date-end", "{{ ds }}"],
+        application_args=["--run-date-start", "{{ macros.ds_add(ds, -1) }}", "--run-date-end", "{{ macros.ds_add(ds, -1) }}"],
         execution_timeout=timedelta(hours=2),
     )
 
@@ -87,7 +88,7 @@ with DAG(
         conn_id="spark_default",
         conf=SPARK_CONF,
         env_vars=_ENV_VARS,
-        application_args=["--run-date-end", "{{ ds }}"],
+        application_args=["--run-date-end", "{{ macros.ds_add(ds, -1) }}"],
         execution_timeout=timedelta(hours=1),
     )
 
@@ -101,7 +102,7 @@ FROM silver."processed_events$snapshots"
 HAVING MAX(committed_at) < current_date""",
     )
 
-    # {{ ds }} 파티션에 데이터가 0건이면 Gold로 진입 차단
+    # ds-1(처리 대상 날짜) 파티션에 데이터가 0건이면 Gold로 진입 차단
     verify_silver_rows = make_athena_gate_task(
         "verify_silver_rows",
         """\

@@ -27,13 +27,16 @@ def make_athena_gate_task(
 ) -> "PythonOperator":
     """0행=정상 구조의 Athena 검증 게이트를 PythonOperator로 생성한다.
 
-    sql_template 내 {ds}는 Airflow 실행 날짜(context["ds"])로 치환된다.
+    sql_template 내 {ds}는 ds-1로 치환된다. silver_batch가 --run-date-start=ds-1로
+    실행되므로 Silver event_date=ds-1, Gold summary_date=ds-1이 검증 대상 파티션이다.
     쿼리 결과가 1행 이상이면 AirflowException — Gold batch 진입 차단 또는 경보 발생.
     """
     from airflow.operators.python import PythonOperator
 
     def _run(**context: object) -> None:
-        sql = sql_template.replace("{ds}", str(context["ds"]))
+        from datetime import datetime, timedelta
+        run_date = (datetime.strptime(str(context["ds"]), "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        sql = sql_template.replace("{ds}", run_date)
         _athena_gate(task_id=task_id, sql=sql, database=database)
 
     return PythonOperator(task_id=task_id, python_callable=_run)
