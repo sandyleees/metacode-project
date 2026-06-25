@@ -87,6 +87,10 @@ Criteo Dataset (HuggingFace streaming)
   Airflow 3.x에서는 `{{ ds }}` = `logical_date.date()` = 트리거 당일.
   DAG 템플릿에서 "처리 대상 날짜(어제)"를 참조할 때는 `{{ macros.ds_add(ds, -1) }}` 사용.
   Python 콜백에서는 `(datetime.strptime(str(context["ds"]), "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")`.
+- **파이프라인 전체 UTC 고정**: Kafka 타임스탬프, Spark container, Airflow 스케줄, S3 파티션 경로 모두 UTC 기준이다.
+  KST 자정(00:00 KST = UTC 전날 15:00) 경계에서 처리하면 날짜가 어긋날 수 있다.
+  현재는 Airflow 스케줄을 KST 낮 시간(~02:00 UTC)에 배치해 회피 중. 근본 해결이 아니므로
+  국제화나 새벽 배치 추가 시 전체 날짜 기준 재검토 필요 (JOBS_GUIDE §5-E5 참고).
 - **`$snapshots` 메타테이블에 `sequence_number` 없음**: 이 Iceberg/Spark 버전의 `$snapshots` 실제 컬럼은
   `committed_at, snapshot_id, parent_id, operation, manifest_list, summary` 뿐이다.
   `sequence_number`를 참조하면 `AnalysisException` 발생. 오늘 변경된 파티션 감지 구현 시
@@ -214,4 +218,8 @@ chore: .gitignore __pycache__ 추가
 - [ ] `build_spark()` 중복 코드 → spark_utils.py 공통화 (raw_to_processed / processed_to_summary / run_sql.py 3곳 중복)
 - [ ] 운영 가시성 개선 — 단기: `make_athena_gate_task()`가 정상 통과 시에도 결과 건수를 `logger.info`로 출력 (현재 0행=정상 구조라 통과 시 아무것도 안 찍힘)
 - [ ] 운영 가시성 개선 — 장기: health-queries/ops/, health-queries/business/ SQL을 Superset 차트로 등록 → 일별 수치 추이 자동 누적 (verify task=alert 전용, Superset=가시성 전용으로 역할 분리)
+- [ ] Superset Dataset 캐싱 미구현 — 24h 캐시 설정 시 하루 1번 Athena 스캔으로 여러 팀 조회 커버 가능 (Superset UI Dataset 설정에서 cache timeout 적용)
 - [ ] DAG verify 게이트 보완 — attribution 변경 파티션(ds-1 외) Silver↔Gold 정합성은 현재 미커버, health-queries/alert 확장 또는 Superset으로 보완 필요 (DAGS_GUIDE §2-3 참고)
+- [ ] Compaction sort/z-order 검토 — 현재 bin-pack(파일 크기 균등화)만 적용. Silver: event_id sort 적용 시 attribution JOIN 파일 스킵 효과 극대화. Gold: campaign sort/z-order 적용 시 Superset 특정 캠페인 조회 성능 개선 가능 (JOBS_GUIDE §5-E6 참고)
+- [ ] **[설계 버그]** Gold snapshot diff가 attribution UPDATE 감지 못함 — `get_changed_event_dates()`가 row count 비교라 Stage 2 click/conv UPDATE만 있는 과거 파티션을 누락. Gold click_count/conv_count stale 가능. 단기 수정: snapshot diff 제거 후 attribution window 30일 항상 재집계. 장기: Silver MOR → COW + eid sort 재설계로 `.changes()` 활성화 (JOBS_GUIDE §5-E7, E8 참고)
+- [ ] DAG Run Conf 연동 구현 — 현재 SparkSubmitOperator application_args가 하드코딩. UI에서 백필 날짜 입력 불가. PythonOperator + XCom으로 dag_run.conf 값을 Spark 인자에 전달하는 구조 필요 (DAGS_GUIDE §2-4 참고)

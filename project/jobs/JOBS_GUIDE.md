@@ -120,12 +120,31 @@ producer는 전송 타이밍만 압축할 뿐 메시지 timestamp는 Criteo 원�
 조건 A만 있으면 논리적으로는 맞지만, Iceberg가 스캔 전에 파티션을 제거(pruning)하지 못한다.  
 두 동적 컬럼의 연산 결과를 스캔 전에 알 수 없기 때문이다.
 
-조건 B는 파티션 키(`event_date`)를 직접 리터럴과 비교하므로, Spark DFP(Dynamic File Pruning)가 인식해  
-불필요한 파티션을 열기 전에 차단한다.  
+조건 B는 파티션 키(`event_date`)를 직접 리터럴과 비교할 수 있는 형태로 만들어  
+Iceberg가 manifest를 읽는 시점에 해당 날짜 이전 파티션을 제거할 수 있게 한다.  
 조건 A와 논리적으로 중복이지만, 성능을 위해 명시적으로 추가한다.
 
 `(c.timestamp - click_window_sec).cast("timestamp")` → click 기준 window 하한을 unix 초에서 Timestamp로 변환  
 `to_date(...)` → Timestamp를 DATE로 변환해 Silver의 `event_date` 파티션 키 타입과 일치시킴
+
+**Iceberg manifest 기반 스캔 축소 — 세 단계**
+
+Iceberg manifest는 각 데이터 파일에 대해 두 가지 정보를 기록한다:
+
+1. **파티션 값** (`event_date=2026-06-18` 등) — 조건 B로 window 밖 파티션 파일 자체를 열지 않음 (deterministic)
+2. **컬럼 단위 min/max 통계** — `event_date` 뿐 아니라 `event_id`(eid) 등 모든 컬럼의 파일 내 min/max를 기록
+
+따라서 Silver 스캔 시 실제 흐름은:
+
+```
+① 조건 B → manifest에서 event_date < lower_bound 파티션 제거
+② 남은 파티션 파일들의 eid min/max 통계로 eid 범위가 맞지 않는 파일 추가 스킵 가능
+③ 남은 파일을 열어 eid 기준 JOIN으로 대상 행 검색
+   (row-level index는 없으므로 파일 내 실제 스캔 필요)
+```
+
+eid가 특정 파일에 있는지는 row-level index 없이는 알 수 없다.  
+파티션 pruning + 파일 min/max 통계로 스캔 대상을 좁힌 뒤, 그 안에서 JOIN으로 찾는 구조다.
 
 ---
 
@@ -208,8 +227,8 @@ Silver는 하루 3커밋 (Stage 1 impression + Stage 2 click + Stage 2 conversio
 21개 ÷ 3커밋/일 = 7일치 metadata.json 보존
 ```
 
-`expire_snapshots`는 30일 기준으로 실행된다.  
-`metadata.json` 보존(7일) < 스냅샷 보존(30일) 이므로, 복구 시 스냅샷 데이터 파일이 살아있다.  
+`expire_snapshots`는 31일 기준으로 실행된다(`older_than = 오늘-31일` → 31일 초과 스냅샷 제거).  
+`metadata.json` 보존(7일) < 스냅샷 보존(31일) 이므로, 복구 시 스냅샷 데이터 파일이 살아있다.  
 이 부등식이 깨지면(`metadata.json` 보존 기간 > 스냅샷 보존 기간) time travel이 불안정해진다.
 
 Gold는 하루 1커밋이므로 `previous-versions-max = 7`로 동일하게 7일을 보존한다.
@@ -262,9 +281,18 @@ MERGE SQL이 실행될 때도 `clk` (click_updates의 원본)가 재사용되기
 
 **일배치 모드** (`--run-date-start` 미지정):
 
-오늘 Silver에 커밋된 변경분만 Iceberg snapshot diff로 감지해 해당 event_date만 재집계한다.  
+오늘 Silver에서 실제로 변경된 event_date만 Iceberg snapshot diff로 감지해 그 파티션만 재집계한다.
+
+**왜 snapshot diff인가 — 3단계 효율 비교:**
+
+| 접근 | 문제점 |
+|---|---|
+| Silver 전체 스캔 | 수개월치 데이터를 매일 전부 읽음 |
+| attribution window 30일치만 스캔 | 30일치를 매일 처음부터 전부 재집계 — 대부분은 어제와 동일 |
+| **snapshot diff (현재)** | 오늘 실제로 변경된 파티션만 재집계 — 가장 최소 범위 |
+
 지연 attribution(지난주 impression에 오늘 click이 매칭됨)으로 갱신된 오래된 event_date도  
-lookback 제한 없이 포함된다.
+lookback 제한 없이 자동 포함된다.
 
 전제: Silver와 Gold가 같은 날 실행된다 — Airflow `criteo_medallion_dag.py`의 DAG 의존성으로 보장.
 
@@ -279,6 +307,12 @@ docker compose --profile batch run --rm processed-to-summary \
   /opt/spark/bin/spark-submit ... \
   --run-date-start 2026-06-01 --run-date-end 2026-06-30
 ```
+
+> **백필 시 주의**: 일배치 모드(snapshot diff)는 같은 날 여러 배치를 실행하는 백필에 사용하면 안 된다.
+> 구현에서 비교 기준은 오늘 첫 번째 snapshot의 `parent_id`이므로, 두 번째·세 번째 배치가
+> Silver를 갱신해도 해당 변경분은 `current vs first_parent` 비교에 이미 반영되어 있거나
+> 추가 감지가 누락될 수 있다.
+> **백필은 반드시 `--run-date-start` 명시 재처리 모드로 실행해야 한다.**
 
 ---
 
@@ -322,23 +356,51 @@ prev_counts = (
 # prev_count가 없거나 달라진 event_date = 오늘 변경된 파티션
 ```
 
+**Silver 1회 배치당 스냅샷 3개 — 왜 "첫 번째 스냅샷의 parent"를 쓰는가**
+
+Silver 배치 1회 실행 시 스냅샷이 3개 생성된다:
+
+```
+S0(어제 마지막) → S1(Stage1 impression INSERT) → S2(Stage2 click MERGE) → S3(Stage2 conv MERGE)
+```
+
+만약 최신 스냅샷(S3)의 parent(= S2)를 before로 쓰면 S3와 S2만 비교해 Stage2 conv 변경분만 보인다.  
+`ORDER BY committed_at ASC LIMIT 1`로 오늘 **첫 번째** 스냅샷(S1)의 parent(= S0)를 before로 삼으면  
+curr(S3) vs before(S0) 비교가 되어 3개 스냅샷의 변경분이 전부 포함된다.
+
 이 방식은 INSERT(새 event_date 추가)와 행 수 변동이 있는 UPDATE를 모두 감지한다.  
 지연 attribution(지난달 impression에 오늘 click이 매칭)으로 오래된 파티션이 변경된 경우도  
 Silver snapshots만 스캔하면 되므로 전체 데이터 읽기보다 훨씬 가볍다.
+
+단, row count 비교 방식의 한계로 click/conv UPDATE만 발생한 파티션은 감지하지 못한다 (§5-E7 참고).
 
 ---
 
 ### 3-3. Iceberg COW 선택 이유
 
 Gold MERGE는 `(summary_date, campaign)` 복합키 기준으로 upsert한다.  
-변경된 event_date의 모든 campaign 행을 매 실행마다 갱신하므로,  
-UPDATE 비율이 거의 100%에 가깝다.
+UPDATE 비율이 거의 100%에 가깝기 때문에 COW가 적합하다.
+
+**왜 UPDATE 비율이 ~100%인가?**
+
+예를 들어 오늘 attribution 처리로 `event_date=2026-06-18`에 속한 impression 중  
+`campaign=7`의 click만 새로 매칭됐다고 가정한다.
+
+1. `get_changed_event_dates()`가 `event_date=2026-06-18` 파티션이 변경됐음을 감지
+2. `aggregate()`가 `event_date=2026-06-18`의 **전체 Silver 행**을 읽어 캠페인별 KPI를 재계산
+3. 이 staged DataFrame에는 campaign=1, 2, ..., 7, 8, 9 ... 모든 캠페인이 포함됨
+4. MERGE INTO 실행 → campaign=7은 값이 달라져 MATCHED UPDATE, **campaign=9 등도 같은 값으로 MATCHED UPDATE**
+
+변경된 campaign이 1개여도, 해당 event_date의 모든 campaign이 staged에 포함되므로 MERGE는 전부 MATCHED UPDATE로 처리한다. MATCHED UPDATE 비율 ≈ 100%.
 
 MOR는 UPDATE 비율이 낮을 때(delta 파일이 적을 때) 읽기 효율이 좋다.  
 UPDATE 비율이 100%면 MOR의 이점이 없고, 오히려 읽기 시 base + delta 병합 오버헤드만 생긴다.  
 COW는 파티션 파일을 전체 재작성하지만, 쓰기 후 파일이 clean하므로 읽기 성능이 항상 일정하다.
 
 Gold는 Superset/Athena의 조회 대상이므로 읽기 성능이 중요하다 → COW가 적합하다.
+
+추가로, Gold는 `campaign × summary_date` 집계 단위라 Silver(행 단위 이벤트 테이블)에 비해 행 수가 훨씬 적다.  
+COW의 파일 재작성 비용 자체가 낮기 때문에 UPDATE ~100%임에도 실용적으로 선택 가능하다.
 
 ---
 
@@ -530,6 +592,97 @@ UTC 기준 "오늘" 시작보다 9시간 이른 전날 자정을 `start_ms`로 �
 UTC 자정 전후 배치 실행이 필요해지면 `date.today()`를 `datetime.now(timezone.utc).date()`로 교체할 것.
 
 이 이슈는 CLAUDE.md "S3 UTC vs KST 타임존 처리" TODO와 연결되어 있다.
+
+---
+
+### E6. Compaction 전략 — sort/z-order 미적용
+
+현재 Iceberg maintenance의 `rewrite_data_files`는 기본 전략인 **bin-pack**(파일 크기 균등화)만 적용한다.
+
+```python
+# 현재
+spark.sql(f"""
+    CALL catalog.system.rewrite_data_files(
+        table => '{SILVER_TABLE}',
+        where => 'event_date >= ...'
+    )
+""")
+```
+
+sort나 z-order 정렬 없이 bin-pack만 하면 파일 크기는 균등해지지만,  
+파일 내 행 순서는 랜덤이다. 이 경우 eid 기준 검색 시 파일을 처음부터 끝까지 스캔한다.
+
+**개선 가능성:**
+
+| 테이블 | 정렬 기준 | 기대 효과 |
+|---|---|---|
+| Silver | `event_id` (sort) | attribution JOIN 시 eid 기준 파일 skip 가능 — min/max 통계 효과 극대화 |
+| Gold | `campaign` (sort 또는 z-order) | Superset/Athena가 특정 campaign 조회 시 파일 skip 가능 |
+
+z-order는 여러 컬럼 조합으로 공간 채우기 커브를 만들어 다차원 필터에 효과적이다.  
+Gold에서 `(campaign, summary_date)` z-order를 적용하면 "특정 캠페인 + 특정 기간" 쿼리 성능이 개선될 수 있다.
+
+현재 미적용 이유: 구현 시점에 bin-pack 이상의 정렬 전략까지는 고려하지 못했다.  
+Silver attribution JOIN 성능 측정 후 필요성이 확인되면 적용을 검토할 것.
+
+### E7. snapshot diff row count 비교 — attribution UPDATE 감지 불가 (Gold 집계 버그)
+
+`get_changed_event_dates()`는 before/after 스냅샷의 **event_date별 행 수**를 비교해 변경 파티션을 감지한다.
+
+**감지 가능:**  
+Silver Stage 1 impression INSERT → 행 수 증가 → 감지 ✓
+
+**감지 불가:**  
+Silver Stage 2 MERGE UPDATE (click/conv) → 기존 행의 값만 변경, 행 수 그대로 → 감지 못함 ✗
+
+결과: `event_date = 6/1` 파티션에 Stage 2 click UPDATE만 발생하면 Gold가 6/1을 재집계하지 않는다.  
+Gold `click_count`, `conv_count`가 attribution 반영 없이 stale 상태로 남는다.
+
+**근본 원인:**  
+Silver가 MOR 테이블이라 Iceberg `.changes()`(changelog scan)를 사용할 수 없다.  
+MOR의 delete file을 changelog scan이 지원하지 않아 `UnsupportedOperationException` 발생.  
+그 대안으로 snapshot diff를 썼는데, row count 비교는 UPDATE를 감지하지 못한다.
+
+**대안 검토:**
+
+| 방식 | 비용 | UPDATE 감지 | 비고 |
+|---|---|---|---|
+| row count 비교 (현재) | Silver 전체 2회 스캔 | ✗ | attribution UPDATE 누락 |
+| SUM(click_flag+conv_flag) 비교 | Silver 전체 2회 스캔 | ✓ | row count보다 비쌈 |
+| attribution window 30일 항상 재집계 | Silver 30일치 1회 스캔 | ✓ | 단순하고 snapshot diff보다 저렴할 수 있음 |
+| Silver COW + eid sort + `.changes()` | 변경 행만 스캔 | ✓ | 설계 변경 필요, 아래 E8 참고 |
+
+가장 단순한 수정: snapshot diff를 제거하고 Gold가 항상 attribution window(30일)를 재집계.  
+Silver 전체를 두 번 스캔하는 현재 방식보다 30일치 1회 스캔이 오히려 저렴할 수 있다.
+
+### E8. Silver MOR vs COW 설계 재검토 — eid 순차 발행 조건에서
+
+producer.py가 HuggingFace 데이터셋을 **순서대로** 읽어 eid를 순차 발행한다.  
+이 조건에서 Silver를 COW로 바꾸고 eid sort/z-order compaction을 적용하면 설계가 더 정합적일 수 있다.
+
+**Silver COW + eid sort compaction 시나리오:**
+
+1. Bronze 내 파일들은 수집 시간 순 → eid가 대체로 단조 증가
+2. Silver COW Stage 2 UPDATE: manifest의 파일별 eid min/max로 대상 파일만 특정
+3. 정렬된 상태에서는 30일치 파티션 × 파티션당 소수 파일만 재작성
+4. delete file 없음 → `.changes()` 사용 가능 → snapshot diff 정확
+5. compaction은 sort 유지 목적으로만 필요 (delete file 정리 불필요)
+
+**현재 MOR + sort compaction과 비교:**
+
+| 항목 | MOR + sort compaction (현재) | COW + eid sort compaction |
+|---|---|---|
+| Stage 2 쓰기 비용 | delete file + 새 파일 (저렴) | eid 범위 걸린 파일만 재작성 |
+| compaction 목적 | delete file 정리 + sort | sort 유지만 |
+| `.changes()` 사용 | ✗ (delete file 때문에 불가) | ✓ |
+| snapshot diff 정확도 | row count 비교 → UPDATE 누락 | `.changes()` → 정확 |
+| eid sort 효과 | 읽기 파일 skip 개선 | 쓰기 파일 skip + 읽기 skip 모두 개선 |
+
+MOR + sort compaction은 읽기 성능은 개선되지만 `.changes()` 불가 문제와 E7 버그는 해결되지 않는다.  
+COW + eid sort는 쓰기 비용이 다소 높아지는 대신 운영 복잡도(delete file 관리)와 집계 정확도 문제가 함께 해소된다.
+
+현재 구현은 MOR을 선택했고, E7 버그가 내재되어 있다.  
+eid 순차 발행이 보장되는 환경에서는 COW + eid sort가 더 정합적인 설계일 수 있다.
 
 ---
 

@@ -104,10 +104,24 @@ send_at = now + (original_delay × conversion_delay_scale / speed_multiplier)
 
 ### 멱등성 미구현
 
-재시작 시 `seen_conversion_ids`가 초기화된다.  
-중단 전 발행한 conversion이 재시작 후 중복 발행될 수 있다.  
-Silver MERGE가 `(event_id, event_date)` 기준 중복을 흡수하므로 downstream 영향은 제한적이나,  
-Kafka 토픽 레벨에서 중복 메시지가 발생한다는 점은 인지하고 있어야 한다.
+재시작 시 더 광범위한 중복 문제가 발생한다.
+
+**HuggingFace 데이터셋 처음부터 재읽기**  
+`producer.py`는 재시작할 때마다 HuggingFace 데이터셋을 첫 번째 행부터 다시 읽어서 발행한다.  
+impression, click, conversion 구분 없이 전체 데이터가 처음부터 중복 발행된다.
+
+**`seen_conversion_ids` 초기화**  
+메모리 내 set이라 재시작 시 초기화된다.  
+conversion 중복 제거가 무력화되어 같은 `conversion_id`가 여러 번 발행된다.
+
+**영향 범위**  
+- Kafka 토픽: 중복 메시지 누적
+- Bronze S3: append-only라 중복 행이 그대로 쌓임
+- Silver: `dedup()` 단계에서 `ingest_ts` 기준 최신 1건만 유지하고 MERGE가 `(event_id, event_date)`로 중복 흡수 → 최종 집계 정합성은 유지됨
+- Gold: Silver 집계 기반이라 영향 없음
+
+Silver dedup이 흡수해주므로 분석 결과에 미치는 영향은 제한적이지만,  
+Bronze에 불필요한 중복 데이터가 쌓인다는 점은 인지해야 한다.
 
 ### Kafka 튜닝 파라미터 미적용
 

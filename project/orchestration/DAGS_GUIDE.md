@@ -67,6 +67,17 @@ Silver 배치를 시작하기 전에 Bronze에 오늘 파티션 파일이 존재
 Bronze가 없으면 Silver 배치를 시작해도 0건 처리 후 정상 종료된다.  
 불필요한 Spark JVM 기동 비용을 막기 위한 방어 로직이다.
 
+**처리 대상 날짜 = 어제**
+
+Airflow 3.x에서 `{{ ds }}` = 트리거 당일, `{{ macros.ds_add(ds, -1) }}` = 어제.  
+이 DAG는 "어제 수집된 Bronze"를 처리한다.
+
+어제 Bronze(`raw_date=어제`)를 Silver로 가공하면:
+- Silver `event_date=어제` 파티션이 신규 생성(당일 impression)
+- Silver `event_date=어제~30일 전` 파티션 일부도 업데이트(attribution으로 오늘 도착한 click/conversion이 과거 impression에 매칭)
+
+verify task가 "어제 파티션 1개"만 확인하는 이유: attribution으로 변경된 과거 파티션은 §2-3 참고.
+
 ### 2-2. verify_* Task (AthenaOperator + PythonOperator)
 
 Silver/Gold 배치 완료 후 즉시 Iceberg `$snapshots` 메타테이블을 조회해 커밋이 발생했는지 확인한다.  
@@ -110,6 +121,78 @@ Bronze raw_date=6/23
 
 과거 파티션 정합성은 `health-queries/alert/` SQL 확장 또는 Superset 차트로 추세를 모니터링하는 방향으로 보완해야 한다 (CLAUDE.md TODO 참고).
 
+**검증 쿼리 재검토 여지**
+
+현재 쿼리는 가장 기본적인 수준(커밋 여부, 행수 > 0, 10% 이내 일치)만 확인한다.
+
+개선 검토 가능한 항목:
+- key 컬럼 null 비율 체크 (event_id, campaign, event_date)
+- click_flag / conv_flag 값 범위 (0 또는 1만 허용)
+- attribution 비율 이상 감지 (e.g. click_flag=1 비율이 갑자기 0%면 Stage 2 미실행 의심)
+- 허용 오차 10% 적정성 재검토 (attribution 지연 데이터 분포 분석 후 조정 가능)
+
+### 2-4. 백필 — 현재 UI 수동 날짜 지정 미구현
+
+**DAG Run Conf란?**
+
+Airflow에서 DAG을 수동으로 트리거할 때 "Trigger DAG w/ config" 옵션으로 JSON 파라미터를 전달하는 기능이다.
+
+```json
+{ "run_date_start": "2026-06-01", "run_date_end": "2026-06-07" }
+```
+
+DAG 내에서는 `{{ dag_run.conf.run_date_start }}`와 같은 Jinja 템플릿이나  
+Python 콜백에서 `context["dag_run"].conf.get("run_date_start")` 으로 접근한다.
+
+**현재 구현의 한계**
+
+현재 `SparkSubmitOperator`의 `application_args`는 코드에 하드코딩되어 있다.
+
+```python
+application_args=[
+    "--run-date-start", "{{ macros.ds_add(ds, -1) }}",
+    "--run-date-end",   "{{ macros.ds_add(ds, -1) }}",
+]
+```
+
+DAG Run Conf와 연결되어 있지 않아, **UI에서 날짜 범위를 입력해도 Spark 잡에 전달되지 않는다.**
+
+**백필 방법 (현재)**
+
+백필(과거 날짜 재처리)이 필요하면 코드를 직접 수정하거나  
+`docker compose` 명령으로 `--run-date-start`/`--run-date-end`를 명시 실행해야 한다.
+
+```bash
+docker compose --profile batch run --rm processed-to-summary \
+  /opt/spark/bin/spark-submit --master spark://spark-master:7077 \
+  --conf spark.cores.max=2 /app/jobs/processed_to_campaign_summary.py \
+  --run-date-start 2026-06-01 --run-date-end 2026-06-07
+```
+
+**DAG Run Conf 연동 구현 방법 (미구현)**
+
+Airflow에서 DAG Run Conf → Spark 인자를 연결하려면  
+`PythonOperator`로 conf를 읽어 XCom에 저장하고, `SparkSubmitOperator`가 XCom 값을 참조하는 구조가 필요하다.
+
+```python
+def resolve_dates(**context):
+    conf = context["dag_run"].conf or {}
+    start = conf.get("run_date_start", macros.ds_add(context["ds"], -1))
+    end   = conf.get("run_date_end",   macros.ds_add(context["ds"], -1))
+    context["ti"].xcom_push(key="run_date_start", value=start)
+    context["ti"].xcom_push(key="run_date_end",   value=end)
+
+resolve = PythonOperator(task_id="resolve_dates", python_callable=resolve_dates)
+
+silver_batch = SparkSubmitOperator(
+    application_args=[
+        "--run-date-start", "{{ ti.xcom_pull(task_ids='resolve_dates', key='run_date_start') }}",
+        "--run-date-end",   "{{ ti.xcom_pull(task_ids='resolve_dates', key='run_date_end') }}",
+    ],
+    ...
+)
+```
+
 ---
 
 ## 3. criteo_maintenance_dag.py — 일간 Iceberg 유지보수
@@ -131,10 +214,11 @@ conversion attribution window가 30일이다.
 35일보다 오래된 파티션은 attribution으로 인한 추가 업데이트가 없으므로  
 compaction 대상에서 제외해 비용을 절약한다.
 
-### 3-2. expire_silver / expire_gold — 왜 30일인가
+### 3-2. expire_silver / expire_gold — 왜 31일인가
 
 Iceberg 스냅샷 보존 목적은 time travel(과거 조회)과 롤백이다.  
-30일 이상 오래된 스냅샷으로 복구해야 하는 장애는 사실상 없다.  
+`older_than = 오늘-31일`로 설정 — 31일 초과된 스냅샷을 제거, 최대 31일 보존.  
+31일 넘은 스냅샷으로 복구해야 하는 장애는 사실상 없다.  
 이 이상 보존하면 S3 비용과 manifest 조회 오버헤드만 증가한다.
 
 ### 3-3. orphan_silver / orphan_gold — 왜 3일인가
