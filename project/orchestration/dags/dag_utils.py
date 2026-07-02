@@ -1,7 +1,12 @@
 """DAG 공통 유틸리티 — SparkSubmitOperator / Athena 검증 게이트 팩토리."""
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from airflow.providers.apache.spark.operators.spark_submit import SparkSubmitOperator
+
+if TYPE_CHECKING:
+    from airflow.operators.python import PythonOperator
 
 from dag_config import ATHENA_RESULTS_S3, PROJECT_DIR, SPARK_CONF
 
