@@ -1,0 +1,11 @@
+[tool.ruff]
+line-length = 120
+exclude = ["presentations/", "week1/", "week2/"]
+
+[tool.ruff.lint]
+# E: pycodestyle 오류, F: pyflakes (미사용 import 등)
+select = ["E", "F"]
+ignore = [
+    "E501",  # line too long (120자 초과는 허용)
+    "F401",  # imported but unused (Spark/Airflow 환경 변수 import 포함)
+]
